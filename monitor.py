@@ -145,6 +145,7 @@ class BotAPI:
         self._offset = 0
         self._running = False
         self._chats_cache: list[str] = []
+        self._auth_callback = None  # async callable(code_str) for auth flow
 
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -280,8 +281,14 @@ class BotAPI:
                 resp = await self.api("getUpdates", offset=self._offset, timeout=30)
                 for upd in resp.get("result", []):
                     self._offset = upd["update_id"] + 1
-                    if "message" in upd and upd["message"].get("text", "").startswith("/"):
-                        await self._handle_cmd_safe(upd["message"])
+                    if "message" in upd:
+                        msg = upd["message"]
+                        txt = msg.get("text", "").strip()
+                        if txt.startswith("/"):
+                            await self._handle_cmd_safe(msg)
+                        elif self._auth_callback and txt:
+                            # During auth flow, any non-command text = auth code
+                            await self._auth_callback(txt)
                     elif "callback_query" in upd:
                         await self._handle_cb(upd["callback_query"])
             except asyncio.CancelledError:
@@ -313,33 +320,129 @@ class LeadMonitor:
         self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         self.watched: set[int] = set()
         self._me_id: Optional[int] = None
+        self._waiting_auth = False
+        self._auth_event = asyncio.Event()
+        self._auth_code: Optional[str] = None
 
     async def _start_client(self):
         sess = Path(f"{SESSION_NAME}.session").exists()
-        if not sess:
-            if not PHONE:
-                logger.error("No session file and no PHONE env var."); sys.exit(1)
-            logger.warning("No session file found, will authorize with phone %s", PHONE)
-        phone = PHONE if PHONE else None
+        if sess:
+            # Try to connect with existing session
+            try:
+                await self.client.connect()
+                if await self.client.is_user_authorized():
+                    logger.info("Session valid, authorized")
+                    return
+                logger.warning("Session exists but not authorized")
+                await self.client.disconnect()
+            except Exception as e:
+                logger.warning("Session invalid (%s), will re-authorize", e)
+                await self.client.disconnect()
+                # Remove corrupt session
+                p = Path(f"{SESSION_NAME}.session")
+                if p.exists():
+                    p.unlink()
+
+        if not PHONE:
+            logger.error("No session and no PHONE env var. Set PHONE in env."); sys.exit(1)
+
+        # Authorize via bot: send code to target chat, wait for reply
+        logger.info("Starting auth flow via bot for phone %s", PHONE)
+        target = self.state.target
+        if not target:
+            logger.error("No target_chat_id set! Set TARGET_CHAT_ID in env or use /target command first.")
+            logger.error("Cannot send auth code without a target chat.")
+            sys.exit(1)
+
         attempts = 0
         while True:
             try:
-                await self.client.start(phone=phone)
+                await self.client.connect()
+                result = await self.client.send_code_request(PHONE)
+                code_hash = result.phone_code_hash
+                logger.info("Auth code sent to %s", PHONE)
+
+                # Notify via bot
+                await self.bot.send(target,
+                    f"\U0001f510 <b>Авторизация Telethon</b>\n\n"
+                    f"Код отправлен на <code>{PHONE}</code>\n\n"
+                    f"Введите код из Telegram в этом чате (просто цифры):")
+
+                # Wait for code via bot message
+                self._waiting_auth = True
+                self._auth_event.clear()
+                self._auth_code = None
+
+                async def _on_auth_code(code):
+                    self._auth_code = code
+                    self._auth_event.set()
+
+                self.bot._auth_callback = _on_auth_code
+                logger.info("Waiting for auth code via bot...")
+                # Start bot polling while waiting
+                poll_task = asyncio.create_task(self.bot.poll())
+                try:
+                    await asyncio.wait_for(self._auth_event.wait(), timeout=300)
+                except asyncio.TimeoutError:
+                    self._waiting_auth = False
+                    poll_task.cancel()
+                    await self.client.disconnect()
+                    attempts += 1
+                    if attempts > 3:
+                        logger.error("Auth timeout 3 times. Exiting.")
+                        sys.exit(1)
+                    logger.warning("Auth code timeout, retrying...")
+                    continue
+                finally:
+                    self._waiting_auth = False
+                    self.bot._auth_callback = None
+                    poll_task.cancel()
+                    try:
+                        await poll_task
+                    except asyncio.CancelledError:
+                        pass
+
+                code = self._auth_code
+                if not code:
+                    logger.error("No code received"); continue
+
+                logger.info("Signing in with code...")
+                await self.client.sign_in(PHONE, code, phone_code_hash=code_hash)
+                logger.info("Authorized successfully!")
                 return
+
             except FloodWaitError as e:
                 attempts += 1
                 wait = min(e.seconds + 5, 600)
-                logger.warning("FloodWait %ds during auth (attempt %d), waiting %ds...", e.seconds, attempts, wait)
+                logger.warning("FloodWait %ds (attempt %d), waiting...", e.seconds, attempts)
                 if attempts > 5:
-                    logger.error("Too many FloodWait errors. Session file may be missing/corrupt on server.")
-                    logger.error("Upload a valid %s.session file or set PHONE env var.", SESSION_NAME)
-                    sys.exit(1)
+                    logger.error("Too many FloodWait errors."); sys.exit(1)
+                await self.client.disconnect()
                 await asyncio.sleep(wait)
             except Exception as e:
                 err = str(e).lower()
                 if "phone number" in err or "invalid" in err:
-                    logger.error("Auth failed: %s. Check PHONE env var.", e)
-                    sys.exit(1)
+                    logger.error("Auth failed: %s", e); sys.exit(1)
+                if "password" in err or "two-step" in err:
+                    await self.bot.send(target,
+                        f"\u26a0\ufe0f <b>Требуется пароль 2FA!</b>\n\n"
+                        f"Введите пароль в этом чате:")
+                    self._waiting_auth = True
+                    self._auth_event.clear()
+                    self._auth_code = None
+                    poll_task = asyncio.create_task(self.bot.poll())
+                    try:
+                        await asyncio.wait_for(self._auth_event.wait(), timeout=300)
+                    except asyncio.TimeoutError:
+                        self._waiting_auth = False; poll_task.cancel(); sys.exit(1)
+                    finally:
+                        self._waiting_auth = False; poll_task.cancel()
+                        try: await poll_task
+                        except asyncio.CancelledError: pass
+                    pwd = self._auth_code
+                    if pwd:
+                        await self.client.sign_in(password=pwd)
+                        logger.info("2FA authorized!"); return
                 raise
 
     async def discover_chats(self):
