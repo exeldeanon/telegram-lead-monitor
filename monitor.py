@@ -485,7 +485,7 @@ class LeadMonitor:
     async def _post_auth(self):
         """Called after successful authorization."""
         await self.discover_chats()
-        self.client.add_event_handler(self.on_msg, events.NewMessage(incoming=True))
+        self.client.add_event_handler(self.on_msg, events.NewMessage())
         logger.info("Listening %d chats, target=%s", len(self.watched), self.state.target)
 
     async def discover_chats(self):
@@ -531,9 +531,15 @@ class LeadMonitor:
             # Skip only own messages from the SAME account (not twinks)
             if is_self:
                 return
+            # Auto-add chat to watched if not present
             if ev.chat_id not in self.watched:
-                logger.warning("NOT WATCHED: chat_id=%s (not in %d watched chats)", ev.chat_id, len(self.watched))
-                return
+                logger.info("AUTO-ADD chat %s to watched", ev.chat_id)
+                self.watched.add(ev.chat_id)
+                chat = await ev.get_chat()
+                ct = getattr(chat, 'title', None) or getattr(chat, 'first_name', '?')
+                cu = getattr(chat, 'username', None)
+                name = f"{ct} (@{cu})" if cu else ct
+                self.bot._chats_cache.append((name, ev.chat_id))
             self.pat = build_pattern(self.state.keywords)
             trig = self.find_trig(normalize(raw))
             if trig is None:
