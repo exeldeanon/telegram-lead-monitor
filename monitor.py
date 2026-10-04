@@ -154,12 +154,16 @@ class BotAPI:
     async def api(self, method: str, **kw) -> dict:
         url = self.BASE.format(token=self.token, method=method)
         s = await self._sess()
+        # Long polling needs timeout > server-side timeout param
+        t = 65 if method == "getUpdates" else 30
         try:
-            async with s.post(url, json=kw, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            async with s.post(url, json=kw, timeout=aiohttp.ClientTimeout(total=t)) as r:
                 data = await r.json()
                 if not data.get("ok"):
                     logger.error("Bot API %s: %s", method, data)
                 return data
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Bot API %s failed", method)
             return {}
@@ -311,15 +315,24 @@ class LeadMonitor:
 
     async def _start_client(self):
         sess = Path(f"{SESSION_NAME}.session").exists()
-        if sess and PHONE:
-            await self.client.start(phone=PHONE)
-        elif sess:
-            # Session exists but no PHONE — use dummy to satisfy Telethon
-            await self.client.start(phone=lambda: "0")
-        else:
+        if not sess:
             if HEADLESS and not PHONE:
                 logger.error("No session file and no PHONE env var."); sys.exit(1)
-            await self.client.start(phone=PHONE)
+            if not PHONE:
+                logger.error("No session file and no PHONE env var."); sys.exit(1)
+        phone = PHONE if PHONE else None
+        while True:
+            try:
+                await self.client.start(phone=phone)
+                return
+            except FloodWaitError as e:
+                logger.warning("FloodWait %ds during auth, waiting...", e.seconds)
+                await asyncio.sleep(e.seconds + 5)
+            except Exception as e:
+                if "phone number" in str(e).lower() or "invalid" in str(e).lower():
+                    logger.error("Auth failed: %s. Ensure PHONE env is set correctly.", e)
+                    sys.exit(1)
+                raise
 
     async def discover_chats(self):
         me = await self.client.get_me(); count = 0; names = []
