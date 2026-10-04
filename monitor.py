@@ -372,23 +372,23 @@ class LeadMonitor:
             await self.client.disconnect()
             p = Path(f"{SESSION_NAME}.session")
             if p.exists(): p.unlink()
+            # Recreate client so it's clean for future auth
+            self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         except Exception as e:
             logger.warning("Session invalid (%s), removing", e)
             try: await self.client.disconnect()
             except Exception: pass
             p = Path(f"{SESSION_NAME}.session")
             if p.exists(): p.unlink()
+            # Recreate client
+            self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         return False
 
     async def _do_auth(self, chat_id: int):
         """Run auth flow via bot."""
         if not PHONE:
             await self.bot.send(chat_id, "\u274c PHONE env var not set"); return
-        # Clean up any existing corrupt session before auth
-        p = Path(f"{SESSION_NAME}.session")
-        if p.exists():
-            if not await self._check_session():
-                logger.info("Removed invalid session before auth")
+        # Check/clean session
         if await self._check_session():
             await self.bot.send(chat_id, "\u2705 Already authorized!")
             await self._post_auth(); return
@@ -546,15 +546,19 @@ class LeadMonitor:
         # Start bot polling FIRST (works without Telethon auth)
         poll_task = asyncio.create_task(self.bot.poll())
 
-        # Check existing session
-        if await self._check_session():
+        # Check existing session once
+        session_valid = await self._check_session()
+        if session_valid:
             await self._post_auth()
             try:
                 await self.client.run_until_disconnected()
             except KeyboardInterrupt:
                 pass
             finally:
-                self.bot.stop(); poll_task.cancel(); await self.bot.close()
+                self.bot.stop(); poll_task.cancel()
+                try: await poll_task
+                except asyncio.CancelledError: pass
+                await self.bot.close()
         else:
             logger.info("No valid session. Waiting for /auth command via bot...")
             target = self.state.target
@@ -569,7 +573,10 @@ class LeadMonitor:
             except KeyboardInterrupt:
                 pass
             finally:
-                self.bot.stop(); poll_task.cancel(); await self.bot.close()
+                self.bot.stop(); poll_task.cancel()
+                try: await poll_task
+                except asyncio.CancelledError: pass
+                await self.bot.close()
 
 
 if __name__=="__main__":
