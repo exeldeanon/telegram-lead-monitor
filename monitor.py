@@ -144,7 +144,7 @@ class BotAPI:
         self._session: Optional[aiohttp.ClientSession] = None
         self._offset = 0
         self._running = False
-        self._chats_cache: list[str] = []
+        self._chats_cache: list[tuple[str, int]] = []  # [(name, chat_id), ...]
         self._auth_callback = None  # async callable(code_str) for auth flow
         self._auth_trigger = None   # async callable(chat_id) to start auth
         self._status_callback = None  # async callable() -> str
@@ -202,8 +202,11 @@ class BotAPI:
     async def answer_cb(self, cb_id: str, text: str = ""):
         await self.api("answerCallbackQuery", callback_query_id=cb_id, text=text)
 
-    async def send(self, chat_id: int, text: str):
-        await self.api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML")
+    async def send(self, chat_id: int, text: str, reply_markup=None):
+        kw = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        if reply_markup:
+            kw["reply_markup"] = reply_markup
+        await self.api("sendMessage", **kw)
 
     async def _handle_cmd(self, msg: dict):
         text = msg.get("text", "").strip()
@@ -232,12 +235,22 @@ class BotAPI:
         elif text.startswith("/target"):
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                await self.send(cid, f"Target: <code>{self.state.target}</code>")
+                await self.send(cid, f"Target: <code>{self.state.target}</code>\n\nUse /target <code>ID</code> or /settarget")
             else:
                 try:
-                    self.state.target = int(parts[1]); await self.send(cid, f"\u2705 <code>{parts[1]}</code>")
+                    self.state.target = int(parts[1]); await self.send(cid, f"\u2705 Target set to <code>{parts[1]}</code>")
                 except ValueError:
                     await self.send(cid, "\u274c Bad ID")
+        elif text == "/settarget":
+            # Show recent chats with inline buttons
+            if not self._chats_cache:
+                await self.send(cid, "No chats discovered yet. Wait for monitor to start.")
+            else:
+                kb_rows = []
+                for i, (chat_name, chat_id) in enumerate(self._chats_cache[:20]):
+                    kb_rows.append([{"text": chat_name[:60], "callback_data": f"settarget:{chat_id}"}])
+                kb = {"inline_keyboard": kb_rows}
+                await self.send(cid, "\U0001f4cb Select target chat:", reply_markup=kb)
         elif text == "/keywords":
             kws = self.state.keywords
             if kws:
@@ -267,7 +280,8 @@ class BotAPI:
                 await self.send(cid, "/delkeyword phrase")
         elif text == "/chats":
             if self._chats_cache:
-                await self.send(cid, "\n".join(f"\u2022 {html.escape(c)}" for c in self._chats_cache[:50]))
+                lines = [f"\u2022 {html.escape(n)} (<code>{cid}</code>)" for n, cid in self._chats_cache[:50]]
+                await self.send(cid, "\n".join(lines))
             else:
                 await self.send(cid, "Not loaded yet")
         elif text == "/stats":
@@ -296,7 +310,8 @@ class BotAPI:
         cid = cb["message"]["chat"]["id"]
         mid = cb["message"]["message_id"]
         un = cb.get("from", {}).get("username") or cb.get("from", {}).get("first_name", "?")
-        if cb.get("data") == "react":
+        data = cb.get("data", "")
+        if data == "react":
             ex = self.state.get_reaction(mid)
             if ex:
                 await self.answer_cb(cb["id"], f"Already: @{ex['user']}")
@@ -307,6 +322,14 @@ class BotAPI:
             new = old + f"\n\n\u2705 <b>\u041e\u0442\u0440\u0435\u0430\u0433\u0438\u0440\u043e\u0432\u0430\u043b:</b> @{html.escape(un)}"
             kb = {"inline_keyboard": [[{"text": f"\u2705 @{un}", "callback_data": "done"}]]}
             await self.edit_msg(cid, mid, new, kb)
+        elif data.startswith("settarget:"):
+            try:
+                target_id = int(data.split(":")[1])
+                self.state.target = target_id
+                await self.answer_cb(cb["id"], f"\u2705 Target set!")
+                await self.send(cid, f"\u2705 Target chat set to <code>{target_id}</code>")
+            except (ValueError, IndexError):
+                await self.answer_cb(cb["id"], "\u274c Error")
 
     async def poll(self):
         self._running = True
@@ -475,7 +498,8 @@ class LeadMonitor:
             if isinstance(e,(Channel,TGChat)):
                 self.watched.add(e.id)
                 t=getattr(e,'title','?'); u=getattr(e,'username',None)
-                names.append(f"{t} (@{u})" if u else t); count+=1
+                name = f"{t} (@{u})" if u else t
+                names.append((name, e.id)); count+=1
         self.bot._chats_cache=names
         if not self.watched:
             logger.error("No chats!"); await self.client.disconnect(); sys.exit(1)
