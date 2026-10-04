@@ -163,6 +163,19 @@ class BotAPI:
             async with s.post(url, json=kw, timeout=aiohttp.ClientTimeout(total=t)) as r:
                 data = await r.json()
                 if not data.get("ok"):
+                    # Handle supergroup migration
+                    params = data.get("parameters", {})
+                    new_cid = params.get("migrate_to_chat_id")
+                    if new_cid:
+                        logger.info("Chat migrated to %s, updating target", new_cid)
+                        self.state.target = new_cid
+                        # Retry with new chat_id
+                        if "chat_id" in payload:
+                            payload["chat_id"] = new_cid
+                        retry_data = await sess.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30))
+                        async with retry_data as resp:
+                            data = await resp.json()
+                        return data
                     logger.error("Bot API %s: %s", method, data)
                 return data
         except asyncio.CancelledError:
