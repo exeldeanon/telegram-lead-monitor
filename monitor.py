@@ -741,6 +741,13 @@ class LeadMonitor:
         try:
             if isinstance(ev.message, MessageService):
                 return
+
+            # ── Фильтр личек: пропускаем только группы и каналы ──────────────
+            chat = await ev.get_chat()
+            if isinstance(chat, User):
+                logger.debug("SKIP DM: chat=%s", ev.chat_id)
+                return
+
             sender = await ev.get_sender()
             if isinstance(sender, User) and sender.bot:
                 logger.debug("SKIP bot: chat=%s sender=%s", ev.chat_id, sender.id)
@@ -748,22 +755,21 @@ class LeadMonitor:
             raw = ev.raw_text or ""
             if not raw.strip():
                 return
-            # Log ALL incoming text messages for debugging
+
             is_self = isinstance(sender, User) and sender.id == self._me_id
             logger.info("MSG|chat=%s|sender=%s|out=%s|self=%s|text='%s'",
                         ev.chat_id, getattr(sender,'id','?'), ev.out, is_self, raw[:80])
-            # Skip only own messages from the SAME account (not twinks)
             if is_self:
                 return
+
             # Auto-add chat to watched if not present
             if ev.chat_id not in self.watched:
                 logger.info("AUTO-ADD chat %s to watched", ev.chat_id)
                 self.watched.add(ev.chat_id)
-                chat = await ev.get_chat()
-                ct = getattr(chat, 'title', None) or getattr(chat, 'first_name', '?')
-                cu = getattr(chat, 'username', None)
-                name = f"{ct} (@{cu})" if cu else ct
-                self.bot._chats_cache.append((name, ev.chat_id))
+                ct0 = getattr(chat, 'title', None) or getattr(chat, 'first_name', '?')
+                cu0 = getattr(chat, 'username', None)
+                self.bot._chats_cache.append((f"{ct0} (@{cu0})" if cu0 else ct0, ev.chat_id))
+
             self.pat = build_pattern(self.state.keywords)
             self.custom_pats = build_custom_patterns(self.state.keywords)
             trig = self.find_trig(normalize(raw))
@@ -773,28 +779,44 @@ class LeadMonitor:
             if self.is_dup(ev.chat_id, raw):
                 logger.debug("DUP: chat=%s", ev.chat_id)
                 return
-            chat = await ev.get_chat()
-            ct = getattr(chat,"title",None) or getattr(chat,"first_name","?")
-            cu = getattr(chat,"username",None)
-            if isinstance(sender,User):
-                sn=f"{sender.first_name or ''} {sender.last_name or ''}".strip() or "?"
-                su,sid=sender.username,sender.id
+
+            ct = getattr(chat, "title", None) or getattr(chat, "first_name", "?")
+            cu = getattr(chat, "username", None)
+            if isinstance(sender, User):
+                sn = f"{sender.first_name or ''} {sender.last_name or ''}".strip() or "?"
+                su, sid = sender.username, sender.id
             else:
-                sn,su,sid=str(sender) if sender else "?",None,0
-            lnk=msg_link(chat,ev.id)
-            logger.info("LEAD|%s|'%s'|%s",ct,trig,sn)
-            cte=html.escape(ct)
-            if cu: cte+=f" (@{html.escape(cu)})"
-            up=f"@{html.escape(su)} / " if su else ""
-            body=(f"\U0001f6a8 <b>\u041b\u0438\u0434!</b>\n\n\U0001f4cd {cte}\n"
-                  f"\U0001f464 {html.escape(sn)} ({up}ID:<code>{sid}</code>)\n"
-                  f"\U0001f511 <code>{html.escape(trig)}</code>\n\n"
-                  f"<blockquote>{html.escape(raw)[:3900]}</blockquote>\n\n"
-                  f'<a href="{lnk}">\u041f\u0435\u0440\u0435\u0439\u0442\u0438</a>')
-            t=self.state.target
+                sn, su, sid = str(sender) if sender else "?", None, 0
+
+            lnk = msg_link(chat, ev.id)
+
+            # Ссылка на сам чат (если есть username — публичная, иначе tg://openmessage)
+            if cu:
+                chat_lnk = f"https://t.me/{cu}"
+            else:
+                chat_lnk = f"https://t.me/c/{abs(ev.chat_id)}/1"
+
+            logger.info("LEAD|chat=%s (id=%s)|trigger='%s'|sender=%s", ct, ev.chat_id, trig, sn)
+
+            cte = html.escape(ct)
+            if cu:
+                cte += f" (@{html.escape(cu)})"
+            up = f"@{html.escape(su)} / " if su else ""
+
+            body = (
+                f"\U0001f6a8 <b>Лид!</b>\n\n"
+                f"\U0001f4cc <b>Обнаружен в:</b> <a href=\"{chat_lnk}\">{cte}</a>  <code>[ID: {ev.chat_id}]</code>\n"
+                f"\U0001f464 <b>Отправитель:</b> {html.escape(sn)} ({up}ID:<code>{sid}</code>)\n"
+                f"\U0001f511 <b>Триггер:</b> <code>{html.escape(trig)}</code>\n\n"
+                f"<blockquote>{html.escape(raw)[:3900]}</blockquote>\n\n"
+                f'<a href="{lnk}">➡️ Перейти к сообщению</a>'
+            )
+
+            t = self.state.target
             if t:
-                mid=await self.bot.send_alert(t,body)
-                if mid: self.state.inc_triggers()
+                mid = await self.bot.send_alert(t, body)
+                if mid:
+                    self.state.inc_triggers()
             else:
                 logger.warning("No target! Use /target")
         except FloodWaitError as e:
