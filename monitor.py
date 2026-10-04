@@ -312,6 +312,7 @@ class LeadMonitor:
         self.bot = BotAPI(BOT_TOKEN, self.state)
         self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         self.watched: set[int] = set()
+        self._me_id: Optional[int] = None
 
     async def _start_client(self):
         sess = Path(f"{SESSION_NAME}.session").exists()
@@ -342,7 +343,8 @@ class LeadMonitor:
                 raise
 
     async def discover_chats(self):
-        me = await self.client.get_me(); count = 0; names = []
+        me = await self.client.get_me(); self._me_id = me.id; count = 0; names = []
+        logger.info("Logged in as: %s (ID: %d)", me.first_name, me.id)
         async for d in self.client.iter_dialogs():
             if d.is_user: continue
             e = d.entity
@@ -366,16 +368,33 @@ class LeadMonitor:
 
     async def on_msg(self, ev):
         try:
-            if ev.out or isinstance(ev.message, MessageService): return
+            if isinstance(ev.message, MessageService):
+                return
             sender = await ev.get_sender()
-            if isinstance(sender, User) and sender.bot: return
-            if ev.chat_id not in self.watched: return
+            if isinstance(sender, User) and sender.bot:
+                logger.debug("SKIP bot: chat=%s sender=%s", ev.chat_id, sender.id)
+                return
             raw = ev.raw_text or ""
-            if not raw.strip(): return
+            if not raw.strip():
+                return
+            # Log ALL incoming text messages for debugging
+            is_self = isinstance(sender, User) and sender.id == self._me_id
+            logger.info("MSG|chat=%s|sender=%s|out=%s|self=%s|text='%s'",
+                        ev.chat_id, getattr(sender,'id','?'), ev.out, is_self, raw[:80])
+            # Skip only own messages from the SAME account (not twinks)
+            if is_self:
+                return
+            if ev.chat_id not in self.watched:
+                logger.warning("NOT WATCHED: chat_id=%s (not in %d watched chats)", ev.chat_id, len(self.watched))
+                return
             self.pat = build_pattern(self.state.keywords)
             trig = self.find_trig(normalize(raw))
-            if trig is None: return
-            if self.is_dup(ev.chat_id, raw): return
+            if trig is None:
+                logger.debug("NO TRIGGER in: '%s'", raw[:60])
+                return
+            if self.is_dup(ev.chat_id, raw):
+                logger.debug("DUP: chat=%s", ev.chat_id)
+                return
             chat = await ev.get_chat()
             ct = getattr(chat,"title",None) or getattr(chat,"first_name","?")
             cu = getattr(chat,"username",None)
