@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Lead Monitor
-Юзербот (Telethon) слушает группы из chats.txt.
+Юзербот (Telethon) слушает ВСЕ группы/каналы аккаунта.
 При совпадении — HTML-алерт через Bot API в TARGET_CHAT_ID со ссылкой на сообщение.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from cachetools import TTLCache
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
-from telethon.tl.types import Channel, Chat, MessageService, User
+from telethon.tl.types import Channel, Chat as TGChat, MessageService, User
 
 load_dotenv()
 API_ID = int(os.environ["API_ID"])
@@ -22,8 +22,9 @@ SESSION_NAME = os.environ.get("SESSION_NAME", "monitor_session")
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 KEYWORDS_FILE = os.environ.get("KEYWORDS_FILE", "keywords.txt")
-CHATS_FILE = os.environ.get("CHATS_FILE", "chats.txt")
 DEDUP_TTL = int(os.environ.get("DEDUP_TTL", 1800))
+PHONE = os.environ.get("PHONE", "")
+HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -132,27 +133,56 @@ class LeadMonitor:
         self.pat = build_pattern(self.kw_norm)
         logger.info("Loaded %d keywords", len(self.kw_norm))
 
-        self.entries = load_lines(CHATS_FILE)
-        logger.info("Loaded %d chat entries", len(self.entries))
-
         self.cache: TTLCache = TTLCache(maxsize=10_000, ttl=DEDUP_TTL)
         self.bot = BotSender(BOT_TOKEN)
         self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
         self.watched: set[int] = set()
 
-    async def resolve(self):
-        for e in self.entries:
-            try:
-                ent = await self.client.get_entity(e)
-                self.watched.add(ent.id)
-                n = getattr(ent, "title", None) or getattr(ent, "first_name", e)
-                logger.info("Watching: %s (%s)", n, ent.id)
-            except Exception:
-                logger.warning("Cannot resolve: %s", e, exc_info=True)
+    async def _start_client(self):
+        """Start with headless support: use PHONE env var if no session."""
+        session_exists = Path(f"{SESSION_NAME}.session").exists()
+        if session_exists:
+            await self.client.start(phone=PHONE or None)
+            return
+
+        if HEADLESS and not PHONE:
+            logger.error(
+                "No session file and no PHONE env var. "
+                "Run locally first to create session, or set PHONE in env."
+            )
+            sys.exit(1)
+
+        if HEADLESS and PHONE:
+            logger.info("Headless mode: using PHONE from env")
+            await self.client.start(phone=PHONE)
+        else:
+            await self.client.start()
+
+    async def discover_chats(self):
+        """Auto-discover all groups/channels the account is in."""
+        me = await self.client.get_me()
+        me_id = me.id
+        count = 0
+        async for dialog in self.client.iter_dialogs():
+            if dialog.is_user:
+                continue  # skip private chats
+            entity = dialog.entity
+            # Skip our own saved messages etc
+            if getattr(entity, 'id', None) == me_id:
+                continue
+            # Only groups and channels
+            if isinstance(entity, (Channel, TGChat)):
+                self.watched.add(entity.id)
+                title = getattr(entity, 'title', '?')
+                uname = getattr(entity, 'username', None)
+                logger.info("Watching: %s (%s) @%s", title, entity.id, uname)
+                count += 1
+
         if not self.watched:
-            logger.error("No chats resolved!")
+            logger.error("No groups/channels found in account!")
             await self.client.disconnect()
             sys.exit(1)
+        logger.info("Discovered %d groups/channels", count)
 
     def is_dup(self, cid: int, txt: str) -> bool:
         k = dedup_key(cid, txt)
@@ -207,9 +237,9 @@ class LeadMonitor:
 
     async def run(self):
         logger.info("Starting Lead Monitor...")
-        await self.client.start()
+        await self._start_client()
         logger.info("Authorized")
-        await self.resolve()
+        await self.discover_chats()
         self.client.add_event_handler(self.on_msg, events.NewMessage(incoming=True))
         logger.info("Listening %d chats → alerts to %s", len(self.watched), TARGET_CHAT_ID)
         try:
