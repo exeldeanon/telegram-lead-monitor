@@ -146,6 +146,8 @@ class BotAPI:
         self._running = False
         self._chats_cache: list[str] = []
         self._auth_callback = None  # async callable(code_str) for auth flow
+        self._auth_trigger = None   # async callable(chat_id) to start auth
+        self._status_callback = None  # async callable() -> str
 
     async def _sess(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -199,7 +201,22 @@ class BotAPI:
         text = text.strip()
         cid = msg["chat"]["id"]
         if text in ("/start", "/help"):
-            await self.send(cid, "\U0001f916 <b>Lead Monitor</b>\n/start /target /keywords /addkeyword /delkeyword /chats /stats")
+            await self.send(cid,
+                "\U0001f916 <b>Lead Monitor v2</b>\n\n"
+                "/auth \u2014 \u0430\u0432\u0442\u043e\u0440\u0438\u0437\u0430\u0446\u0438\u044f Telethon\n"
+                "/target <code>ID</code> \u2014 \u0447\u0430\u0442 \u0434\u043b\u044f \u0430\u043b\u0435\u0440\u0442\u043e\u0432\n"
+                "/keywords \u2014 \u0442\u0440\u0438\u0433\u0433\u0435\u0440\u044b\n"
+                "/addkeyword <code>\u0444\u0440\u0430\u0437\u0430</code>\n"
+                "/delkeyword <code>\u0444\u0440\u0430\u0437\u0430</code>\n"
+                "/chats \u2014 \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043c\u044b\u0435 \u0447\u0430\u0442\u044b\n"
+                "/stats \u2014 \u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0430\n"
+                "/status \u2014 \u0441\u0442\u0430\u0442\u0443\u0441 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f")
+        elif text == "/auth":
+            # Delegate to LeadMonitor via callback
+            if self._auth_trigger:
+                await self._auth_trigger(cid)
+            else:
+                await self.send(cid, "\u274c Auth not available")
         elif text.startswith("/target"):
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
@@ -245,6 +262,12 @@ class BotAPI:
             s = self.state.stats; t, r = s["total_triggers"], s["reacted"]
             p = round(r/t*100,1) if t else 0
             await self.send(cid, f"Triggers: {t} | Reacted: {r} ({p}%) | Pending: {t-r}")
+        elif text == "/status":
+            if self._status_callback:
+                status = await self._status_callback()
+                await self.send(cid, status)
+            else:
+                await self.send(cid, "\u274c Status not available")
         else:
             return
         # If we got here without sending anything for a known command, log it
@@ -324,126 +347,82 @@ class LeadMonitor:
         self._auth_event = asyncio.Event()
         self._auth_code: Optional[str] = None
 
-    async def _start_client(self):
+    async def _check_session(self) -> bool:
+        """Check if existing session is valid."""
         sess = Path(f"{SESSION_NAME}.session").exists()
-        if sess:
-            # Try to connect with existing session
-            try:
-                await self.client.connect()
-                if await self.client.is_user_authorized():
-                    logger.info("Session valid, authorized")
-                    return
-                logger.warning("Session exists but not authorized")
-                await self.client.disconnect()
-            except Exception as e:
-                logger.warning("Session invalid (%s), will re-authorize", e)
-                await self.client.disconnect()
-                # Remove corrupt session
-                p = Path(f"{SESSION_NAME}.session")
-                if p.exists():
-                    p.unlink()
+        if not sess:
+            return False
+        try:
+            await self.client.connect()
+            if await self.client.is_user_authorized():
+                logger.info("Session valid, authorized"); return True
+            await self.client.disconnect()
+        except Exception as e:
+            logger.warning("Session invalid (%s), removing", e)
+            await self.client.disconnect()
+            p = Path(f"{SESSION_NAME}.session")
+            if p.exists(): p.unlink()
+        return False
 
+    async def _do_auth(self, chat_id: int):
+        """Run auth flow via bot."""
         if not PHONE:
-            logger.error("No session and no PHONE env var. Set PHONE in env."); sys.exit(1)
-
-        # Authorize via bot: send code to target chat, wait for reply
-        logger.info("Starting auth flow via bot for phone %s", PHONE)
-        target = self.state.target
-        if not target:
-            logger.error("No target_chat_id set! Set TARGET_CHAT_ID in env or use /target command first.")
-            logger.error("Cannot send auth code without a target chat.")
-            sys.exit(1)
-
+            await self.bot.send(chat_id, "\u274c PHONE env var not set"); return
+        if await self._check_session():
+            await self.bot.send(chat_id, "\u2705 Already authorized!")
+            await self._post_auth(); return
         attempts = 0
-        while True:
+        while attempts < 3:
             try:
                 await self.client.connect()
                 result = await self.client.send_code_request(PHONE)
                 code_hash = result.phone_code_hash
-                logger.info("Auth code sent to %s", PHONE)
-
-                # Notify via bot
-                await self.bot.send(target,
-                    f"\U0001f510 <b>Авторизация Telethon</b>\n\n"
-                    f"Код отправлен на <code>{PHONE}</code>\n\n"
-                    f"Введите код из Telegram в этом чате (просто цифры):")
-
-                # Wait for code via bot message
-                self._waiting_auth = True
-                self._auth_event.clear()
-                self._auth_code = None
-
-                async def _on_auth_code(code):
-                    self._auth_code = code
-                    self._auth_event.set()
-
-                self.bot._auth_callback = _on_auth_code
-                logger.info("Waiting for auth code via bot...")
-                # Start bot polling while waiting
-                poll_task = asyncio.create_task(self.bot.poll())
+                await self.bot.send(chat_id,
+                    f"\U0001f510 <b>Auth</b>\nCode sent to <code>{PHONE}</code>\n\nEnter code here:")
+                self._waiting_auth = True; self._auth_event.clear(); self._auth_code = None
+                async def _on_code(c):
+                    self._auth_code = c; self._auth_event.set()
+                self.bot._auth_callback = _on_code
                 try:
                     await asyncio.wait_for(self._auth_event.wait(), timeout=300)
                 except asyncio.TimeoutError:
-                    self._waiting_auth = False
-                    poll_task.cancel()
-                    await self.client.disconnect()
-                    attempts += 1
-                    if attempts > 3:
-                        logger.error("Auth timeout 3 times. Exiting.")
-                        sys.exit(1)
-                    logger.warning("Auth code timeout, retrying...")
-                    continue
+                    self._waiting_auth=False; self.bot._auth_callback=None
+                    await self.client.disconnect(); attempts+=1
+                    await self.bot.send(chat_id,"\u23f0 Timeout. Try /auth again."); continue
                 finally:
-                    self._waiting_auth = False
-                    self.bot._auth_callback = None
-                    poll_task.cancel()
-                    try:
-                        await poll_task
-                    except asyncio.CancelledError:
-                        pass
-
+                    self._waiting_auth=False; self.bot._auth_callback=None
                 code = self._auth_code
-                if not code:
-                    logger.error("No code received"); continue
-
-                logger.info("Signing in with code...")
-                await self.client.sign_in(PHONE, code, phone_code_hash=code_hash)
-                logger.info("Authorized successfully!")
-                return
-
+                if not code: continue
+                try:
+                    await self.client.sign_in(PHONE, code, phone_code_hash=code_hash)
+                except Exception as e:
+                    if "password" in str(e).lower() or "two-step" in str(e).lower():
+                        await self.bot.send(chat_id,"\u26a0\ufe0f Enter 2FA password:")
+                        self._waiting_auth=True; self._auth_event.clear(); self._auth_code=None
+                        self.bot._auth_callback=_on_code
+                        try: await asyncio.wait_for(self._auth_event.wait(),timeout=300)
+                        except asyncio.TimeoutError:
+                            self._waiting_auth=False;self.bot._auth_callback=None;continue
+                        finally: self._waiting_auth=False;self.bot._auth_callback=None
+                        if self._auth_code: await self.client.sign_in(password=self._auth_code)
+                        else: continue
+                    else: raise
+                await self.bot.send(chat_id,"\u2705 <b>Authorized!</b> Starting monitor...")
+                await self._post_auth(); return
             except FloodWaitError as e:
-                attempts += 1
-                wait = min(e.seconds + 5, 600)
-                logger.warning("FloodWait %ds (attempt %d), waiting...", e.seconds, attempts)
-                if attempts > 5:
-                    logger.error("Too many FloodWait errors."); sys.exit(1)
+                attempts+=1; w=min(e.seconds+5,600)
                 await self.client.disconnect()
-                await asyncio.sleep(wait)
+                await self.bot.send(chat_id,f"\u23f3 FloodWait {e.seconds}s...")
+                await asyncio.sleep(w)
             except Exception as e:
-                err = str(e).lower()
-                if "phone number" in err or "invalid" in err:
-                    logger.error("Auth failed: %s", e); sys.exit(1)
-                if "password" in err or "two-step" in err:
-                    await self.bot.send(target,
-                        f"\u26a0\ufe0f <b>Требуется пароль 2FA!</b>\n\n"
-                        f"Введите пароль в этом чате:")
-                    self._waiting_auth = True
-                    self._auth_event.clear()
-                    self._auth_code = None
-                    poll_task = asyncio.create_task(self.bot.poll())
-                    try:
-                        await asyncio.wait_for(self._auth_event.wait(), timeout=300)
-                    except asyncio.TimeoutError:
-                        self._waiting_auth = False; poll_task.cancel(); sys.exit(1)
-                    finally:
-                        self._waiting_auth = False; poll_task.cancel()
-                        try: await poll_task
-                        except asyncio.CancelledError: pass
-                    pwd = self._auth_code
-                    if pwd:
-                        await self.client.sign_in(password=pwd)
-                        logger.info("2FA authorized!"); return
-                raise
+                await self.bot.send(chat_id,f"\u274c Error: {e}"); return
+        await self.bot.send(chat_id,"\u274c Too many attempts. Try later.")
+
+    async def _post_auth(self):
+        """Called after successful authorization."""
+        await self.discover_chats()
+        self.client.add_event_handler(self.on_msg, events.NewMessage(incoming=True))
+        logger.info("Listening %d chats, target=%s", len(self.watched), self.state.target)
 
     async def discover_chats(self):
         me = await self.client.get_me(); self._me_id = me.id; count = 0; names = []
@@ -531,17 +510,45 @@ class LeadMonitor:
 
     async def run(self):
         logger.info("Starting v2...")
-        await self._start_client()
-        await self.discover_chats()
-        self.client.add_event_handler(self.on_msg, events.NewMessage(incoming=True))
-        logger.info("Listening %d chats, target=%s",len(self.watched),self.state.target)
-        pt=asyncio.create_task(self.bot.poll())
-        try:
-            await self.client.run_until_disconnected()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.bot.stop(); pt.cancel(); await self.bot.close()
+        # Wire up bot callbacks
+        self.bot._auth_trigger = lambda cid: self._do_auth(cid)
+        async def _status():
+            auth = await self._check_session() if not self.watched else True
+            check = "\u2705" if auth and self.watched else "\u274c"
+            return (f"\U0001f4ca <b>Status</b>\n\n"
+                    f"Auth: {check}\n"
+                    f"Chats: {len(self.watched)}\n"
+                    f"Target: <code>{self.state.target}</code>\n"
+                    f"Keywords: {len(self.state.keywords)}")
+        self.bot._status_callback = _status
+
+        # Start bot polling FIRST (works without Telethon auth)
+        poll_task = asyncio.create_task(self.bot.poll())
+
+        # Check existing session
+        if await self._check_session():
+            await self._post_auth()
+            try:
+                await self.client.run_until_disconnected()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.bot.stop(); poll_task.cancel(); await self.bot.close()
+        else:
+            logger.info("No valid session. Waiting for /auth command via bot...")
+            target = self.state.target
+            if target:
+                await self.bot.send(target,
+                    "\u26a0\ufe0f <b>Telethon not authorized!</b>\n\n"
+                    "Use /auth to start authorization.")
+            # Keep running bot polling, wait forever
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                self.bot.stop(); poll_task.cancel(); await self.bot.close()
 
 
 if __name__=="__main__":
