@@ -100,7 +100,7 @@ class State:
         return self.data["stats"]
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Smart Keyword Engine ─────────────────────────────────────────────────────
 
 def load_lines(fp: str) -> list[str]:
     p = Path(fp)
@@ -110,17 +110,240 @@ def load_lines(fp: str) -> list[str]:
             if l.strip() and not l.strip().startswith("#")]
 
 
+# Транслит латиница → кириллица (люди пишут в разной раскладке)
+_TRANSLIT_MAP: dict[str, str] = {
+    "a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е",
+    "z": "з", "i": "и", "j": "й", "k": "к", "l": "л", "m": "м",
+    "n": "н", "o": "о", "p": "п", "r": "р", "s": "с", "t": "т",
+    "u": "у", "f": "ф", "h": "х", "c": "к", "y": "у", "x": "кс",
+    "w": "в", "q": "к",
+    # Частые смешанные замены (латиница выглядит как кириллица)
+    "а": "а", "е": "е", "о": "о", "р": "р", "с": "с", "х": "х",
+    "у": "у", "к": "к", "м": "м", "т": "т", "в": "в", "н": "н",
+}
+
+# Кириллица «a, e, o, p, c, x, y» — омонимы латиницы, уже кирилл, не трогаем.
+# Маппинг только для чистой латиницы:
+_LAT_TO_CYR = str.maketrans({
+    "a": "а", "b": "б", "v": "в", "g": "г", "d": "д",
+    "z": "з", "j": "й", "k": "к", "l": "л", "m": "м",
+    "n": "н", "p": "п", "r": "р", "s": "с", "t": "т",
+    "u": "у", "f": "ф", "h": "х", "w": "в", "q": "к",
+    "A": "а", "B": "б", "V": "в", "G": "г", "D": "д",
+    "Z": "з", "J": "й", "K": "к", "L": "л", "M": "м",
+    "N": "н", "P": "п", "R": "р", "S": "с", "T": "т",
+    "U": "у", "F": "ф", "H": "х", "W": "в", "Q": "к",
+})
+
+# «Смешанная» латиница-омонимы кириллицы: e→е, o→о, c→с, x→х, y→у
+_MIXED_LAT_MAP = str.maketrans({
+    "e": "е", "o": "о", "c": "с", "x": "х", "y": "у",
+    "E": "е", "O": "о", "C": "с", "X": "х", "Y": "у",
+    "a": "а", "A": "а", "p": "р", "P": "р",
+})
+
+
 def normalize(text: str) -> str:
+    """
+    Нормализация текста:
+    1. NFKC + lowercase + ё→е
+    2. Убираем zero-width и спец-символы
+    3. Конвертируем «смешанные» латиница-омонимы → кириллицу
+    4. Слова только из латиницы — транслитерируем в кириллицу
+    5. Удаляем не-словарные символы, схлопываем пробелы
+    """
     if not text:
         return ""
-    t = unicodedata.normalize("NFKC", text).lower().replace("\u0451", "\u0435")
+    t = unicodedata.normalize("NFKC", text).lower()
+    t = t.replace("ё", "е").replace("й", "й")
+    # Убираем zero-width, мягкий дефис и прочий невидимый мусор
+    t = re.sub(r"[\u00ad\u200b-\u200f\u2060\ufeff]", "", t)
+    # Обрабатываем по словам
+    words = re.split(r"(\s+)", t)
+    out = []
+    for w in words:
+        if re.fullmatch(r"\s+", w):
+            out.append(w)
+            continue
+        # Если слово содержит кириллицу — заменяем только латиница-омонимы
+        if re.search(r"[а-яёa-z]", w):
+            if re.search(r"[а-яё]", w):
+                # смешанное — омонимы латиницы → кирилл
+                w = w.translate(_MIXED_LAT_MAP)
+            else:
+                # чистая латиница — транслитерируем
+                w = w.translate(_LAT_TO_CYR)
+        out.append(w)
+    t = "".join(out)
+    # Убираем не-буквы/не-цифры/не-пробелы (пунктуацию, спецсимволы)
     t = re.sub(r"[^\w\s]", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+# ── Паттерны по тематическим кластерам ──────────────────────────────────────
+#
+# Формат строки keywords.txt:
+#   PATTERN:regex — прямой regex-паттерн (применяется к нормализованному тексту)
+#   #comment      — комментарий, игнорируется
+#   обычная фраза — точное вхождение (как раньше)
+#
+# Для умных паттернов используем префикс PATTERN:
+
+# Встроенные смарт-кластеры (всегда активны, поверх keywords.txt)
+_BUILTIN_SMART_PATTERNS: list[tuple[str, str]] = [
+    # ── Лиды / базы ──────────────────────────────────────────────────────────
+    ("лиды (общее)",
+     r"\bли[дт][ыауе]?\b"),
+    ("горячие лиды",
+     r"\b(горяч\w*\s+ли[дт]|ли[дт]\w*\s+горяч)\w*\b"),
+    ("купить/нужны лиды",
+     r"\b(куп\w+|нужн\w+|ищ\w+|продам|продаю|отдам|есть|слив\w+)\s+\w{0,10}\s*ли[дт]\w*\b"),
+    ("база/базы",
+     r"\b(баз[аыуе]|базы|базк\w+)\b"),
+    ("купить базу",
+     r"\b(куп\w+|нужн\w+|ищ\w+|где\s+взять|где\s+брать|продам|продаю)\s+\w{0,15}\s*(баз[аыуе]|базы)\b"),
+    ("парсинг/парсер",
+     r"\bпарс\w+\b"),
+    ("отказники",
+     r"\бот(каз|цеп|лип)\w*\b|\bотказник\w*\b"),
+    ("контакты/база контактов",
+     r"\bконтакт\w*\b|\bбаз[аы]\s+контакт\w*\b|\bищу\s+\w{0,10}\s*контакт\w*\b"),
+    ("номера телефонов",
+     r"\bномер[аыа]?\s+(телефон\w*|мобильн\w*|сотовых\w*)\b|\bтелефонн\w+\s+баз\w+\b|\bбаз[аы]\s+номер\w*\b|\bномера\s+для\s+обзвон\w*\b"),
+
+    # ── HR / рекрутинг ───────────────────────────────────────────────────────
+    ("HR общее",
+     r"\bhr\b|\bh[рp]\b|\bэйч\s*ар\b|\bхр\b"),
+    ("рекрутинг",
+     r"\bрекрут\w+\b"),
+    ("подбор персонала",
+     r"\bподбор\s+(персонал|сотрудник|кадр|специалист|работник|людей|staff)\w*\b"),
+    ("нужен HR/рекрутер",
+     r"\b(нужен|ищу|куп\w+|заказ\w+|найти|посовет\w+|кто\s+зан\w+|где\s+найти)\s+\w{0,20}\s*(hr\b|рекрут\w+|подборщ\w+|кадров\w+)\b"),
+    ("вакансии/отклики",
+     r"\b(отклик|вакансия|вакансии|резюме|кандидат)\w*\b"),
+    ("найм сотрудников",
+     r"\b(найм|наймем|нанять|трудоустройств)\w*\b"),
+
+    # ── МФО / Кредиты / Финансы ──────────────────────────────────────────────
+    ("МФО",
+     r"\bмфо\b|\bмикрозайм\w*\b|\bмикрофинанс\w*\b"),
+    ("кредитные лиды",
+     r"\b(кредит\w*|займ\w*|ссуд\w*)\s+\w{0,10}\s*(ли[дт]\w*|баз\w+|отказ\w+)\b"),
+    ("финансовые офферы",
+     r"\b(финанс\w+|финк\w+|фино\w+)\s+(оффер|офер|предложени)\w*\b|\bфинансов\w+\s+оффер\w*\b"),
+    ("отказники МФО/кредиты",
+     r"\bотказник\w*\s+\w{0,10}\s*(мфо|кредит|займ)\w*\b|\b(мфо|кредит|займ)\w*\s+\w{0,10}\s*отказник\w*\b"),
+    ("банкротство",
+     r"\bбанкротств\w+\b|\bбанкрот\b"),
+    ("рко",
+     r"\bрко\b|\bрасчетн\w+\s+счет\w*\b|\bоткрыт\w+\s+счет\w*\b"),
+
+    # ── Беттинг / Гемблинг ───────────────────────────────────────────────────
+    ("беттинг/ставки",
+     r"\b(бетт\w+|ставк\w+|букмек\w+|беттинг\w*|betting|sports?bet)\b"),
+    ("казино/гемблинг",
+     r"\b(казино|гемблинг|gambling|слот\w+|онлайн.казино)\b"),
+    ("лиды для беттинга",
+     r"\bли[дт]\w*\s+\w{0,15}\s*(бетт\w+|ставк\w+|казино|гемблинг)\b|\b(бетт\w+|ставк\w+|казино)\w*\s+\w{0,15}\s*ли[дт]\w*\b"),
+
+    # ── Арбитраж трафика ─────────────────────────────────────────────────────
+    ("арбитраж",
+     r"\bарбитраж\w*\b|\bарб\b"),
+    ("трафик",
+     r"\b(трафик|траф\b|тrafik)\w*\b"),
+    ("мотивированный трафик",
+     r"\b(мотив\w+)\s+\w{0,10}\s*(трафик|траф)\w*\b|\bмотив\w+\s+(юзер|install|инсталл)\w*\b"),
+    ("офферы",
+     r"\bоффер\w*\b|\bофер\w+\b"),
+    ("партнёрка/CPA",
+     r"\b(партнёрка|партнерка|cpa|cpа|аффилиат|affiliate)\w*\b"),
+
+    # ── ИП / Самозанятые ─────────────────────────────────────────────────────
+    ("ИП/самозанятые",
+     r"\b(новорег\w*|предрег\w*)\b|\b(новорег\w+|предрег\w+)\s+\w{0,10}\s*ип\b|\bип\w*\s+\w{0,10}\s*(новорег|предрег)\w*\b"),
+    ("регистрация ИП",
+     r"\b(регистрац\w+|открыт\w+)\s+\w{0,10}\s*ип\b"),
+
+    # ── Курьеры / Персонал ───────────────────────────────────────────────────
+    ("курьеры",
+     r"\bкурьер\w+\b"),
+    ("поиск персонала",
+     r"\b(поиск|ищу|нужен|нужны)\s+\w{0,15}\s*(персонал|сотрудник|курьер|работник|специалист)\w*\b"),
+
+    # ── Запрос у автора/поставщика ───────────────────────────────────────────
+    ("поставщик баз/лидов",
+     r"\bпоставщик\w*\s+\w{0,15}\s*(баз|лид|данных)\w*\b|\b(баз|лид)\w*\s+поставщик\w*\b"),
+    ("где купить/найти",
+     r"\b(где\s+(купить|взять|брать|найти|достать)|посовет\w+|кто\s+(продаёт|продает|занимается|может))\s+\w{0,25}\s*(баз\w+|лид\w+|hr\b|рекрут\w+|мфо|трафик|персонал)\w*\b"),
+    ("продам/слив данных",
+     r"\b(продам|продаю|сливаю|слив\b|отдам|есть\s+в\s+наличии)\s+\w{0,15}\s*(баз\w+|лид\w+|данны)\w*\b"),
+]
+
+# Компилируем встроенные паттерны один раз
+_COMPILED_BUILTIN: list[tuple[str, re.Pattern]] = [
+    (name, re.compile(pat, re.IGNORECASE | re.UNICODE))
+    for name, pat in _BUILTIN_SMART_PATTERNS
+]
 
 
 def build_pattern(kws: list[str]) -> re.Pattern:
-    kws = sorted(kws, key=len, reverse=True)
-    return re.compile("|".join(re.escape(k) for k in kws), re.IGNORECASE)
+    """Строит паттерн из обычных ключевых фраз (keywords.txt без PATTERN:)."""
+    plain = []
+    for k in kws:
+        if k.startswith("PATTERN:"):
+            continue  # обрабатываются отдельно в find_trigger
+        plain.append(k)
+    if not plain:
+        # Фиктивный паттерн, который ничего не найдёт (но не падает)
+        return re.compile(r"(?!)", re.IGNORECASE)
+    plain = sorted(plain, key=len, reverse=True)
+    return re.compile("|".join(re.escape(normalize(k)) for k in plain), re.IGNORECASE)
+
+
+def build_custom_patterns(kws: list[str]) -> list[tuple[str, re.Pattern]]:
+    """Строит список именованных паттернов из строк PATTERN:name=regex."""
+    result = []
+    for k in kws:
+        if not k.startswith("PATTERN:"):
+            continue
+        rest = k[len("PATTERN:"):]
+        if "=" in rest:
+            name, _, pat = rest.partition("=")
+            try:
+                result.append((name.strip(), re.compile(pat.strip(), re.IGNORECASE | re.UNICODE)))
+            except re.error as ex:
+                logger.warning("Bad PATTERN '%s': %s", name, ex)
+    return result
+
+
+def find_trigger(normalized_text: str, plain_pat: re.Pattern,
+                 custom_pats: list[tuple[str, re.Pattern]]) -> Optional[str]:
+    """
+    Ищет первый сработавший триггер в нормализованном тексте.
+    Возвращает человекочитаемое название триггера или None.
+
+    Порядок проверки:
+      1. Встроенные смарт-кластеры (_COMPILED_BUILTIN)
+      2. Пользовательские PATTERN: строки из keywords.txt
+      3. Точные ключевые фразы из keywords.txt
+    """
+    for name, pat in _COMPILED_BUILTIN:
+        m = pat.search(normalized_text)
+        if m:
+            return f"{name} [{m.group(0)}]"
+
+    for name, pat in custom_pats:
+        m = pat.search(normalized_text)
+        if m:
+            return f"{name} [{m.group(0)}]"
+
+    m = plain_pat.search(normalized_text)
+    if m:
+        return m.group(0)
+
+    return None
 
 
 def dedup_key(cid: int, text: str) -> str:
@@ -373,6 +596,7 @@ class LeadMonitor:
                 self.state.keywords = fk
                 logger.info("Loaded %d keywords from file", len(fk))
         self.pat = build_pattern(self.state.keywords)
+        self.custom_pats = build_custom_patterns(self.state.keywords)
         self.cache: TTLCache = TTLCache(maxsize=10_000, ttl=DEDUP_TTL)
         self.bot = BotAPI(BOT_TOKEN, self.state)
         self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
@@ -510,8 +734,8 @@ class LeadMonitor:
         if k in self.cache: return True
         self.cache[k]=True; return False
 
-    def find_trig(self,nt):
-        m=self.pat.search(nt); return m.group(0) if m else None
+    def find_trig(self, nt: str) -> Optional[str]:
+        return find_trigger(nt, self.pat, self.custom_pats)
 
     async def on_msg(self, ev):
         try:
@@ -541,6 +765,7 @@ class LeadMonitor:
                 name = f"{ct} (@{cu})" if cu else ct
                 self.bot._chats_cache.append((name, ev.chat_id))
             self.pat = build_pattern(self.state.keywords)
+            self.custom_pats = build_custom_patterns(self.state.keywords)
             trig = self.find_trig(normalize(raw))
             if trig is None:
                 logger.debug("NO TRIGGER in: '%s'", raw[:60])
