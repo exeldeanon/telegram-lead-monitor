@@ -188,6 +188,10 @@ class BotAPI:
 
     async def _handle_cmd(self, msg: dict):
         text = msg.get("text", "").strip()
+        # Strip @BotName suffix from commands
+        if "@" in text.split()[0]:
+            text = text.split("@")[0] + (" " + " ".join(text.split()[1:]) if len(text.split()) > 1 else "")
+        text = text.strip()
         cid = msg["chat"]["id"]
         if text in ("/start", "/help"):
             await self.send(cid, "\U0001f916 <b>Lead Monitor</b>\n/start /target /keywords /addkeyword /delkeyword /chats /stats")
@@ -236,6 +240,17 @@ class BotAPI:
             s = self.state.stats; t, r = s["total_triggers"], s["reacted"]
             p = round(r/t*100,1) if t else 0
             await self.send(cid, f"Triggers: {t} | Reacted: {r} ({p}%) | Pending: {t-r}")
+        else:
+            return
+        # If we got here without sending anything for a known command, log it
+    async def _handle_cmd_safe(self, msg: dict):
+        try:
+            await self._handle_cmd(msg)
+        except Exception as e:
+            logger.exception("Command handler error")
+            cid = msg.get("chat", {}).get("id")
+            if cid:
+                await self.send(cid, f"\u274c Error: {e}")
 
     async def _handle_cb(self, cb: dict):
         cid = cb["message"]["chat"]["id"]
@@ -262,7 +277,7 @@ class BotAPI:
                 for upd in resp.get("result", []):
                     self._offset = upd["update_id"] + 1
                     if "message" in upd and upd["message"].get("text", "").startswith("/"):
-                        await self._handle_cmd(upd["message"])
+                        await self._handle_cmd_safe(upd["message"])
                     elif "callback_query" in upd:
                         await self._handle_cb(upd["callback_query"])
             except asyncio.CancelledError:
