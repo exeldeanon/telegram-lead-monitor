@@ -368,10 +368,14 @@ class LeadMonitor:
             await self.client.connect()
             if await self.client.is_user_authorized():
                 logger.info("Session valid, authorized"); return True
+            logger.warning("Session not authorized, removing")
             await self.client.disconnect()
+            p = Path(f"{SESSION_NAME}.session")
+            if p.exists(): p.unlink()
         except Exception as e:
             logger.warning("Session invalid (%s), removing", e)
-            await self.client.disconnect()
+            try: await self.client.disconnect()
+            except Exception: pass
             p = Path(f"{SESSION_NAME}.session")
             if p.exists(): p.unlink()
         return False
@@ -380,6 +384,11 @@ class LeadMonitor:
         """Run auth flow via bot."""
         if not PHONE:
             await self.bot.send(chat_id, "\u274c PHONE env var not set"); return
+        # Clean up any existing corrupt session before auth
+        p = Path(f"{SESSION_NAME}.session")
+        if p.exists():
+            if not await self._check_session():
+                logger.info("Removed invalid session before auth")
         if await self._check_session():
             await self.bot.send(chat_id, "\u2705 Already authorized!")
             await self._post_auth(); return
