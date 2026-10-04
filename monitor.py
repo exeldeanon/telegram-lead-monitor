@@ -224,9 +224,9 @@ class BotAPI:
                 "/stats \u2014 \u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0430\n"
                 "/status \u2014 \u0441\u0442\u0430\u0442\u0443\u0441 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f")
         elif text == "/auth":
-            # Delegate to LeadMonitor via callback
+            # Delegate to LeadMonitor via callback (run as separate task!)
             if self._auth_trigger:
-                await self._auth_trigger(cid)
+                asyncio.create_task(self._auth_trigger(cid))
             else:
                 await self.send(cid, "\u274c Auth not available")
         elif text.startswith("/target"):
