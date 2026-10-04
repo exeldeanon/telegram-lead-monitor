@@ -170,11 +170,10 @@ class BotAPI:
                         logger.info("Chat migrated to %s, updating target", new_cid)
                         self.state.target = new_cid
                         # Retry with new chat_id
-                        if "chat_id" in payload:
-                            payload["chat_id"] = new_cid
-                        retry_data = await sess.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30))
-                        async with retry_data as resp:
-                            data = await resp.json()
+                        if "chat_id" in kw:
+                            kw["chat_id"] = new_cid
+                        async with s.post(url, json=kw, timeout=aiohttp.ClientTimeout(total=30)) as r2:
+                            data = await r2.json()
                         return data
                     logger.error("Bot API %s: %s", method, data)
                 return data
