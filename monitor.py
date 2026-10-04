@@ -316,21 +316,28 @@ class LeadMonitor:
     async def _start_client(self):
         sess = Path(f"{SESSION_NAME}.session").exists()
         if not sess:
-            if HEADLESS and not PHONE:
-                logger.error("No session file and no PHONE env var."); sys.exit(1)
             if not PHONE:
                 logger.error("No session file and no PHONE env var."); sys.exit(1)
+            logger.warning("No session file found, will authorize with phone %s", PHONE)
         phone = PHONE if PHONE else None
+        attempts = 0
         while True:
             try:
                 await self.client.start(phone=phone)
                 return
             except FloodWaitError as e:
-                logger.warning("FloodWait %ds during auth, waiting...", e.seconds)
-                await asyncio.sleep(e.seconds + 5)
+                attempts += 1
+                wait = min(e.seconds + 5, 600)
+                logger.warning("FloodWait %ds during auth (attempt %d), waiting %ds...", e.seconds, attempts, wait)
+                if attempts > 5:
+                    logger.error("Too many FloodWait errors. Session file may be missing/corrupt on server.")
+                    logger.error("Upload a valid %s.session file or set PHONE env var.", SESSION_NAME)
+                    sys.exit(1)
+                await asyncio.sleep(wait)
             except Exception as e:
-                if "phone number" in str(e).lower() or "invalid" in str(e).lower():
-                    logger.error("Auth failed: %s. Ensure PHONE env is set correctly.", e)
+                err = str(e).lower()
+                if "phone number" in err or "invalid" in err:
+                    logger.error("Auth failed: %s. Check PHONE env var.", e)
                     sys.exit(1)
                 raise
 
