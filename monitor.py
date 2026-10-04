@@ -295,11 +295,16 @@ class LeadMonitor:
         self.watched: set[int] = set()
 
     async def _start_client(self):
-        if Path(f"{SESSION_NAME}.session").exists():
-            await self.client.start(phone=PHONE or None); return
-        if HEADLESS and not PHONE:
-            logger.error("No session and no PHONE"); sys.exit(1)
-        await self.client.start(phone=PHONE if HEADLESS else None)
+        sess = Path(f"{SESSION_NAME}.session").exists()
+        if sess and PHONE:
+            await self.client.start(phone=PHONE)
+        elif sess:
+            # Session exists but no PHONE — use dummy to satisfy Telethon
+            await self.client.start(phone=lambda: "0")
+        else:
+            if HEADLESS and not PHONE:
+                logger.error("No session file and no PHONE env var."); sys.exit(1)
+            await self.client.start(phone=PHONE)
 
     async def discover_chats(self):
         me = await self.client.get_me(); count = 0; names = []
