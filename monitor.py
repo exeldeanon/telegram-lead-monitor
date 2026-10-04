@@ -388,16 +388,20 @@ class LeadMonitor:
         """Run auth flow via bot."""
         if not PHONE:
             await self.bot.send(chat_id, "\u274c PHONE env var not set"); return
-        # Check/clean session
+        # Check/clean session once
         if await self._check_session():
             await self.bot.send(chat_id, "\u2705 Already authorized!")
             await self._post_auth(); return
+        logger.info("Starting auth flow for %s", PHONE)
         attempts = 0
         while attempts < 3:
             try:
+                logger.info("Auth attempt %d: connecting...", attempts+1)
                 await self.client.connect()
+                logger.info("Connected, requesting code...")
                 result = await self.client.send_code_request(PHONE)
                 code_hash = result.phone_code_hash
+                logger.info("Code sent successfully")
                 await self.bot.send(chat_id,
                     f"\U0001f510 <b>Auth</b>\nCode sent to <code>{PHONE}</code>\n\nEnter code here:")
                 self._waiting_auth = True; self._auth_event.clear(); self._auth_code = None
@@ -414,10 +418,13 @@ class LeadMonitor:
                     self._waiting_auth=False; self.bot._auth_callback=None
                 code = self._auth_code
                 if not code: continue
+                logger.info("Received code, signing in...")
                 try:
                     await self.client.sign_in(PHONE, code, phone_code_hash=code_hash)
                 except Exception as e:
-                    if "password" in str(e).lower() or "two-step" in str(e).lower():
+                    err_msg = str(e).lower()
+                    logger.warning("sign_in error: %s", e)
+                    if "password" in err_msg or "two-step" in err_msg:
                         await self.bot.send(chat_id,"\u26a0\ufe0f Enter 2FA password:")
                         self._waiting_auth=True; self._auth_event.clear(); self._auth_code=None
                         self.bot._auth_callback=_on_code
@@ -427,15 +434,27 @@ class LeadMonitor:
                         finally: self._waiting_auth=False;self.bot._auth_callback=None
                         if self._auth_code: await self.client.sign_in(password=self._auth_code)
                         else: continue
+                    elif "already" in err_msg or "blocked" in err_msg or "reported" in err_msg:
+                        attempts += 1
+                        await self.client.disconnect()
+                        await self.bot.send(chat_id,
+                            f"\u26a0\ufe0f Telegram blocked this code.\n"
+                            f"Wait 1-2 min and try /auth again.\n"
+                            f"(Attempt {attempts}/3)")
+                        await asyncio.sleep(90)
+                        continue
                     else: raise
+                logger.info("Authorized successfully!")
                 await self.bot.send(chat_id,"\u2705 <b>Authorized!</b> Starting monitor...")
                 await self._post_auth(); return
             except FloodWaitError as e:
                 attempts+=1; w=min(e.seconds+5,600)
+                logger.warning("FloodWait %ds", e.seconds)
                 await self.client.disconnect()
                 await self.bot.send(chat_id,f"\u23f3 FloodWait {e.seconds}s...")
                 await asyncio.sleep(w)
             except Exception as e:
+                logger.exception("Auth failed")
                 await self.bot.send(chat_id,f"\u274c Error: {e}"); return
         await self.bot.send(chat_id,"\u274c Too many attempts. Try later.")
 
