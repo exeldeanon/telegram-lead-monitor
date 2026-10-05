@@ -29,6 +29,11 @@ HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 DEFAULT_TARGET = int(os.environ.get("TARGET_CHAT_ID", "0"))
 
+# RouterAI config for lead classification
+ROUTERAI_API_KEY = os.environ.get("ROUTERAI_API_KEY", "")
+ROUTERAI_MODEL = os.environ.get("ROUTERAI_MODEL", "qwen/qwen2.5-7b-instruct")
+ROUTERAI_ENABLED = bool(ROUTERAI_API_KEY)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -634,6 +639,73 @@ class BotAPI:
             await self._session.close()
 
 
+# ── RouterAI Lead Classifier ────────────────────────────────────────────────
+
+_CLASSIFY_PROMPT = """Ты — классификатор лидов для Telegram. Проанализируй сообщение и определи, является ли оно РЕАЛЬНЫМ лидом (предложение услуг, запрос на покупку, поиск исполнителя) или ЛОЖНЫМ срабатыванием (просто упоминание ключевого слова в обычном разговоре).
+
+Ответь ТОЛЬКО в формате JSON:
+{"is_lead": true/false, "confidence": 0.0-1.0, "reason": "краткое объяснение"}
+
+Примеры РЕАЛЬНЫХ лидов:
+- "Ищу дизайнера для логотипа, бюджет 5000р"
+- "Нужны лиды для автосервиса в Москве"
+- "Кто может сделать сайт под ключ?"
+
+Примеры ЛОЖНЫХ срабатываний:
+- "Вчера видел рекламу про лиды"
+- "Слово 'база' тут не к месту"
+- Обычный разговор где случайно встретилось ключевое слово
+
+Сообщение для анализа:
+"""
+
+
+async def classify_lead(text: str, trigger: str) -> dict:
+    """Classify if a message is a real lead or false positive using RouterAI."""
+    if not ROUTERAI_ENABLED:
+        return {"is_lead": True, "confidence": 1.0, "reason": "RouterAI disabled"}
+
+    prompt = _CLASSIFY_PROMPT + f"\n[Триггер: '{trigger}']\n{text[:2000]}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://routerai.ru/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {ROUTERAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": ROUTERAI_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 200,
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+
+        content = data["choices"][0]["message"]["content"].strip()
+        # Extract JSON from response
+        json_match = re.search(r'\{[^}]+\}', content)
+        if json_match:
+            result = json.loads(json_match.group())
+            return {
+                "is_lead": bool(result.get("is_lead", True)),
+                "confidence": float(result.get("confidence", 0.5)),
+                "reason": result.get("reason", ""),
+            }
+        logger.warning("RouterAI: could not parse JSON from response: %s", content[:100])
+        return {"is_lead": True, "confidence": 0.5, "reason": "Parse error, defaulting to lead"}
+
+    except asyncio.TimeoutError:
+        logger.warning("RouterAI: timeout")
+        return {"is_lead": True, "confidence": 0.5, "reason": "Timeout, defaulting to lead"}
+    except Exception as e:
+        logger.error("RouterAI error: %s", e)
+        return {"is_lead": True, "confidence": 0.5, "reason": f"Error: {e}"}
+
+
 class LeadMonitor:
     def __init__(self):
         self.state = State(STATE_FILE)
@@ -845,6 +917,18 @@ class LeadMonitor:
 
             logger.info("LEAD|chat=%s (id=%s)|trigger='%s'|sender=%s", ct, ev.chat_id, trig, sn)
 
+            # AI classification (if enabled)
+            if ROUTERAI_ENABLED:
+                classification = await classify_lead(raw, trig)
+                logger.info("AI_CLASSIFY|is_lead=%s|confidence=%.2f|reason=%s",
+                           classification["is_lead"], classification["confidence"], classification["reason"])
+                if not classification["is_lead"] and classification["confidence"] >= 0.7:
+                    logger.info("FALSE_POSITIVE filtered by AI: '%s'", raw[:60])
+                    return
+                ai_info = f"\n\n🤖 <i>AI: {'✅ Лид' if classification['is_lead'] else '⚠️ Сомнительно'} ({classification['confidence']:.0%}) — {html.escape(classification['reason'])}</i>"
+            else:
+                ai_info = ""
+
             cte = html.escape(ct)
             if cu:
                 cte += f" (@{html.escape(cu)})"
@@ -857,6 +941,7 @@ class LeadMonitor:
                 f"\U0001f511 <b>Триггер:</b> <code>{html.escape(trig)}</code>\n\n"
                 f"<blockquote>{html.escape(raw)[:3900]}</blockquote>\n\n"
                 f'<a href="{lnk}">➡️ Перейти к сообщению</a>'
+                f'{ai_info}'
             )
 
             t = self.state.target
