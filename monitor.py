@@ -31,7 +31,7 @@ DEFAULT_TARGET = int(os.environ.get("TARGET_CHAT_ID", "0"))
 
 # RouterAI config for lead classification
 ROUTERAI_API_KEY = os.environ.get("ROUTERAI_API_KEY", "")
-ROUTERAI_MODEL = os.environ.get("ROUTERAI_MODEL", "deepseek/deepseek-chat")
+ROUTERAI_MODEL = os.environ.get("ROUTERAI_MODEL", "qwen/qwen-2.5-7b-instruct")
 ROUTERAI_ENABLED = bool(ROUTERAI_API_KEY)
 
 logging.basicConfig(
