@@ -479,6 +479,10 @@ class BotAPI:
                     await self.send(cid, f"\u2705 Sent! Message ID: {mid}")
                 else:
                     await self.send(cid, "\u274c Failed to send. Check logs for details.")
+        elif text == "/chatid":
+            chat = msg.get("chat", {})
+            title = chat.get("title") or chat.get("first_name") or "?"
+            await self.send(cid, f"\U0001f4cb <b>{html.escape(title)}</b>\nID: <code>{cid}</code>")
         elif text == "/settarget":
             # Show recent chats with inline buttons
             if not self._chats_cache:
