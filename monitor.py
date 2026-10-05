@@ -413,7 +413,11 @@ class BotAPI:
         resp = await self.api("sendMessage", chat_id=chat_id, text=body,
                               parse_mode="HTML", disable_web_page_preview=True,
                               reply_markup=kb)
-        return resp["result"]["message_id"] if resp.get("ok") else None
+        if resp.get("ok"):
+            return resp["result"]["message_id"]
+        else:
+            logger.error("send_alert FAILED to %s: %s", chat_id, resp)
+            return None
 
     async def edit_msg(self, chat_id: int, msg_id: int, text: str, kb=None):
         kw = {"chat_id": chat_id, "message_id": msg_id, "text": text,
@@ -464,6 +468,17 @@ class BotAPI:
                     self.state.target = int(parts[1]); await self.send(cid, f"\u2705 Target set to <code>{parts[1]}</code>")
                 except ValueError:
                     await self.send(cid, "\u274c Bad ID")
+        elif text == "/testalert":
+            t = self.state.target
+            if not t:
+                await self.send(cid, "\u274c No target set. Use /target first")
+            else:
+                await self.send(cid, f"\U0001f680 Sending test alert to <code>{t}</code>...")
+                mid = await self.send_alert(t, "\U0001f9ea <b>Test Alert</b>\n\nIf you see this, target is working!")
+                if mid:
+                    await self.send(cid, f"\u2705 Sent! Message ID: {mid}")
+                else:
+                    await self.send(cid, "\u274c Failed to send. Check logs for details.")
         elif text == "/settarget":
             # Show recent chats with inline buttons
             if not self._chats_cache:
