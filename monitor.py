@@ -47,6 +47,7 @@ class State:
         self.path = Path(path)
         self.data = {
             "target_chat_id": DEFAULT_TARGET,
+            "target_thread_id": 0,  # topic/thread ID for forum groups
             "keywords": [],
             "stats": {"total_triggers": 0, "reacted": 0},
             "reactions": {},  # alert_msg_id -> {"user": name, "time": ts}
@@ -72,6 +73,15 @@ class State:
     @target.setter
     def target(self, v: int):
         self.data["target_chat_id"] = v
+        self.save()
+
+    @property
+    def thread_id(self) -> int:
+        return self.data.get("target_thread_id", 0)
+
+    @thread_id.setter
+    def thread_id(self, v: int):
+        self.data["target_thread_id"] = v
         self.save()
 
     @property
@@ -406,17 +416,20 @@ class BotAPI:
             logger.exception("Bot API %s failed", method)
             return {}
 
-    async def send_alert(self, chat_id: int, body: str) -> Optional[int]:
+    async def send_alert(self, chat_id: int, body: str, thread_id: int = 0) -> Optional[int]:
         kb = {"inline_keyboard": [[
             {"text": "\u2705 \u041e\u0442\u0440\u0435\u0430\u0433\u0438\u0440\u043e\u0432\u0430\u0442\u044c", "callback_data": "react"}
         ]]}
-        resp = await self.api("sendMessage", chat_id=chat_id, text=body,
-                              parse_mode="HTML", disable_web_page_preview=True,
-                              reply_markup=kb)
+        kw = {"chat_id": chat_id, "text": body,
+              "parse_mode": "HTML", "disable_web_page_preview": True,
+              "reply_markup": kb}
+        if thread_id:
+            kw["message_thread_id"] = thread_id
+        resp = await self.api("sendMessage", **kw)
         if resp.get("ok"):
             return resp["result"]["message_id"]
         else:
-            logger.error("send_alert FAILED to %s: %s", chat_id, resp)
+            logger.error("send_alert FAILED to %s (thread=%s): %s", chat_id, thread_id, resp)
             return None
 
     async def edit_msg(self, chat_id: int, msg_id: int, text: str, kb=None):
@@ -473,8 +486,9 @@ class BotAPI:
             if not t:
                 await self.send(cid, "\u274c No target set. Use /target first")
             else:
-                await self.send(cid, f"\U0001f680 Sending test alert to <code>{t}</code>...")
-                mid = await self.send_alert(t, "\U0001f9ea <b>Test Alert</b>\n\nIf you see this, target is working!")
+                tid = self.state.thread_id
+                await self.send(cid, f"\U0001f680 Sending test alert to <code>{t}</code> (thread={tid})...")
+                mid = await self.send_alert(t, "\U0001f9ea <b>Test Alert</b>\n\nIf you see this, target is working!", tid)
                 if mid:
                     await self.send(cid, f"\u2705 Sent! Message ID: {mid}")
                 else:
@@ -482,7 +496,21 @@ class BotAPI:
         elif text == "/chatid":
             chat = msg.get("chat", {})
             title = chat.get("title") or chat.get("first_name") or "?"
-            await self.send(cid, f"\U0001f4cb <b>{html.escape(title)}</b>\nID: <code>{cid}</code>")
+            thread = msg.get("message_thread_id", 0)
+            txt = f"\U0001f4cb <b>{html.escape(title)}</b>\nChat ID: <code>{cid}</code>"
+            if thread:
+                txt += f"\nThread/Topic ID: <code>{thread}</code>"
+            await self.send(cid, txt)
+        elif text.startswith("/thread"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await self.send(cid, f"Current thread_id: <code>{self.state.thread_id}</code>\n\nUse /thread <code>ID</code> (get it via /chatid in the topic)")
+            else:
+                try:
+                    self.state.thread_id = int(parts[1])
+                    await self.send(cid, f"\u2705 Thread ID set to <code>{parts[1]}</code>")
+                except ValueError:
+                    await self.send(cid, "\u274c Bad ID")
         elif text == "/settarget":
             # Show recent chats with inline buttons
             if not self._chats_cache:
@@ -833,7 +861,7 @@ class LeadMonitor:
 
             t = self.state.target
             if t:
-                mid = await self.bot.send_alert(t, body)
+                mid = await self.bot.send_alert(t, body, self.state.thread_id)
                 if mid:
                     self.state.inc_triggers()
             else:
