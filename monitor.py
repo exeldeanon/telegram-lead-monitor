@@ -641,23 +641,26 @@ class BotAPI:
 
 # ── RouterAI Lead Classifier ────────────────────────────────────────────────
 
-_CLASSIFY_PROMPT = """Ты — классификатор лидов для Telegram. Проанализируй сообщение и определи, является ли оно РЕАЛЬНЫМ лидом (предложение услуг, запрос на покупку, поиск исполнителя) или ЛОЖНЫМ срабатыванием (просто упоминание ключевого слова в обычном разговоре).
+_CLASSIFY_PROMPT = """Ты — классификатор лидов для Telegram чатов. Твоя задача определить, является ли сообщение РЕАЛЬНЫМ бизнес-лидом или это обычное упоминание ключевого слова.
 
-Ответь ТОЛЬКО в формате JSON:
-{"is_lead": true/false, "confidence": 0.0-1.0, "reason": "краткое объяснение"}
+РЕАЛЬНЫЙ ЛИД — это когда человек:
+- Ищет услуги/товары ("ищу дизайнера", "нужен сайт")
+- Предлагает купить/продать ("куплю базу", "продам лиды")  
+- Запрашивает контакты/сотрудничество
+- Конкретный запрос с деталями (бюджет, сроки, ниша)
 
-Примеры РЕАЛЬНЫХ лидов:
-- "Ищу дизайнера для логотипа, бюджет 5000р"
-- "Нужны лиды для автосервиса в Москве"
-- "Кто может сделать сайт под ключ?"
+ЛОЖНОЕ СРАБАТЫВАНИЕ — это когда:
+- Просто упоминается слово в разговоре
+- Обсуждение темы без конкретного запроса
+- Шутки, мемы, оффтопик
+- Новостной/информационный контекст
 
-Примеры ЛОЖНЫХ срабатываний:
-- "Вчера видел рекламу про лиды"
-- "Слово 'база' тут не к месту"
-- Обычный разговор где случайно встретилось ключевое слово
+Ответь СТРОГО в JSON формате (без markdown):
+{"is_lead": true, "confidence": 0.95, "reason": "конкретный запрос на покупку лидов"}
+или
+{"is_lead": false, "confidence": 0.9, "reason": "просто упоминание слова в разговоре"}
 
-Сообщение для анализа:
-"""
+Сообщение:"""
 
 
 async def classify_lead(text: str, trigger: str) -> dict:
@@ -918,16 +921,20 @@ class LeadMonitor:
             logger.info("LEAD|chat=%s (id=%s)|trigger='%s'|sender=%s", ct, ev.chat_id, trig, sn)
 
             # AI classification (if enabled)
+            ai_info = ""
             if ROUTERAI_ENABLED:
-                classification = await classify_lead(raw, trig)
-                logger.info("AI_CLASSIFY|is_lead=%s|confidence=%.2f|reason=%s",
-                           classification["is_lead"], classification["confidence"], classification["reason"])
-                if not classification["is_lead"] and classification["confidence"] >= 0.7:
-                    logger.info("FALSE_POSITIVE filtered by AI: '%s'", raw[:60])
-                    return
-                ai_info = f"\n\n🤖 <i>AI: {'✅ Лид' if classification['is_lead'] else '⚠️ Сомнительно'} ({classification['confidence']:.0%}) — {html.escape(classification['reason'])}</i>"
-            else:
-                ai_info = ""
+                try:
+                    classification = await classify_lead(raw, trig)
+                    logger.info("AI_CLASSIFY|is_lead=%s|confidence=%.2f|reason=%s",
+                               classification["is_lead"], classification["confidence"], classification["reason"])
+                    # Only filter if VERY confident it's NOT a lead
+                    if not classification["is_lead"] and classification["confidence"] >= 0.85:
+                        logger.info("FALSE_POSITIVE filtered by AI: '%s'", raw[:60])
+                        return
+                    ai_info = f"\n\n🤖 <i>AI: {'✅ Лид' if classification['is_lead'] else '⚠️ Сомнительно'} ({classification['confidence']:.0%}) — {html.escape(classification['reason'])}</i>"
+                except Exception as e:
+                    logger.error("AI classification failed: %s", e)
+                    # Continue without AI filtering on error
 
             cte = html.escape(ct)
             if cu:
