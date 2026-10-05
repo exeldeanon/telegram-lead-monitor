@@ -31,7 +31,7 @@ DEFAULT_TARGET = int(os.environ.get("TARGET_CHAT_ID", "0"))
 
 # RouterAI config for lead classification
 ROUTERAI_API_KEY = os.environ.get("ROUTERAI_API_KEY", "")
-ROUTERAI_MODEL = os.environ.get("ROUTERAI_MODEL", "qwen/qwen2.5-7b-instruct")
+ROUTERAI_MODEL = os.environ.get("ROUTERAI_MODEL", "deepseek/deepseek-chat")
 ROUTERAI_ENABLED = bool(ROUTERAI_API_KEY)
 
 logging.basicConfig(
@@ -688,6 +688,12 @@ async def classify_lead(text: str, trigger: str) -> dict:
             ) as resp:
                 data = await resp.json()
 
+        logger.debug("RouterAI response: %s", str(data)[:500])
+        
+        if "choices" not in data:
+            logger.error("RouterAI: no 'choices' in response: %s", str(data)[:300])
+            return {"is_lead": True, "confidence": 0.5, "reason": f"API error: {data.get('error', {}).get('message', 'unknown')}"}
+            
         content = data["choices"][0]["message"]["content"].strip()
         # Extract JSON from response
         json_match = re.search(r'\{[^}]+\}', content)
