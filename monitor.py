@@ -57,9 +57,10 @@ class State:
             "target_chat_id": DEFAULT_TARGET,
             "target_thread_id": 0,  # topic/thread ID for forum groups
             "keywords": [],
-            "stats": {"total_triggers": 0, "reacted": 0},
+            "stats": {"total_triggers": 0, "reacted": 0, "ai_filtered": 0, "ai_passed": 0},
             "reactions": {},  # alert_msg_id -> {"user": name, "time": ts}
             "sent_hashes": {},  # dedup_hash -> timestamp
+            "blacklisted_chats": [],  # chat IDs to ignore
         }
         self._load()
 
@@ -150,6 +151,35 @@ class State:
         if before != after:
             logger.info("Cleaned up %d old dedup hashes", before - after)
             self.save()
+
+    # ── Blacklist ────────────────────────────────────────────────────────────
+    @property
+    def blacklisted_chats(self) -> list[int]:
+        return self.data.get("blacklisted_chats", [])
+
+    def is_blacklisted(self, chat_id: int) -> bool:
+        return chat_id in self.blacklisted_chats
+
+    def blacklist_chat(self, chat_id: int):
+        bl = self.data.setdefault("blacklisted_chats", [])
+        if chat_id not in bl:
+            bl.append(chat_id)
+            self.save()
+
+    def unblacklist_chat(self, chat_id: int):
+        bl = self.data.get("blacklisted_chats", [])
+        if chat_id in bl:
+            bl.remove(chat_id)
+            self.save()
+
+    # ── AI Stats ─────────────────────────────────────────────────────────────
+    def inc_ai_filtered(self):
+        self.data["stats"]["ai_filtered"] = self.data["stats"].get("ai_filtered", 0) + 1
+        self.save()
+
+    def inc_ai_passed(self):
+        self.data["stats"]["ai_passed"] = self.data["stats"].get("ai_passed", 0) + 1
+        self.save()
 
 
 # ── Smart Keyword Engine ─────────────────────────────────────────────────────
@@ -423,7 +453,13 @@ def find_trigger(normalized_text: str, plain_pat: re.Pattern,
 
 
 def dedup_key(cid: int, text: str) -> str:
+    """Legacy text-based dedup key (kept for compatibility)."""
     return hashlib.sha256(f"{cid}:{normalize(text)}".encode()).hexdigest()[:16]
+
+
+def msg_dedup_key(chat_id: int, message_id: int) -> str:
+    """Unique key per message — never collides for different messages."""
+    return f"{chat_id}:{message_id}"
 
 
 def msg_link(chat, mid: int) -> str:
@@ -524,14 +560,16 @@ class BotAPI:
         if text in ("/start", "/help"):
             await self.send(cid,
                 "\U0001f916 <b>Lead Monitor v2</b>\n\n"
-                "/auth \u2014 \u0430\u0432\u0442\u043e\u0440\u0438\u0437\u0430\u0446\u0438\u044f Telethon\n"
-                "/target <code>ID</code> \u2014 \u0447\u0430\u0442 \u0434\u043b\u044f \u0430\u043b\u0435\u0440\u0442\u043e\u0432\n"
-                "/keywords \u2014 \u0442\u0440\u0438\u0433\u0433\u0435\u0440\u044b\n"
-                "/addkeyword <code>\u0444\u0440\u0430\u0437\u0430</code>\n"
-                "/delkeyword <code>\u0444\u0440\u0430\u0437\u0430</code>\n"
-                "/chats \u2014 \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043c\u044b\u0435 \u0447\u0430\u0442\u044b\n"
-                "/stats \u2014 \u0441\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043a\u0430\n"
-                "/status \u2014 \u0441\u0442\u0430\u0442\u0443\u0441 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f")
+                "/auth — авторизация Telethon\n"
+                "/target <code>ID</code> — чат для алертов\n"
+                "/keywords — триггеры\n"
+                "/addkeyword <code>фраза</code>\n"
+                "/delkeyword <code>фраза</code>\n"
+                "/chats — мониторимые чаты\n"
+                "/stats — статистика + AI\n"
+                "/status — статус подключения\n"
+                "/blacklist <code>ID</code> — исключить чат\n"
+                "/unblacklist <code>ID</code> — вернуть чат")
         elif text == "/auth":
             # Delegate to LeadMonitor via callback (run as separate task!)
             if self._auth_trigger:
@@ -621,9 +659,47 @@ class BotAPI:
             else:
                 await self.send(cid, "Not loaded yet")
         elif text == "/stats":
-            s = self.state.stats; t, r = s["total_triggers"], s["reacted"]
-            p = round(r/t*100,1) if t else 0
-            await self.send(cid, f"Triggers: {t} | Reacted: {r} ({p}%) | Pending: {t-r}")
+            s = self.state.stats
+            t = s.get("total_triggers", 0)
+            r = s.get("reacted", 0)
+            ai_f = s.get("ai_filtered", 0)
+            ai_p = s.get("ai_passed", 0)
+            p = round(r/t*100, 1) if t else 0
+            bl = len(self.state.blacklisted_chats)
+            await self.send(cid, 
+                f"📊 <b>Статистика</b>\n\n"
+                f"🔔 Триггеры: {t}\n"
+                f"✅ Реагировали: {r} ({p}%)\n"
+                f"🤖 AI отфильтровано: {ai_f}\n"
+                f"🤖 AI пропущено: {ai_p}\n"
+                f"🚫 Чатов в блэклисте: {bl}")
+        elif text.startswith("/blacklist"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                bl = self.state.blacklisted_chats
+                if bl:
+                    lines = [f"• <code>{c}</code>" for c in bl]
+                    await self.send(cid, "🚫 <b>Blacklisted chats:</b>\n" + "\n".join(lines))
+                else:
+                    await self.send(cid, "Blacklist is empty. Use /blacklist <code>chat_id</code>")
+            else:
+                try:
+                    bl_id = int(parts[1])
+                    self.state.blacklist_chat(bl_id)
+                    await self.send(cid, f"✅ Chat <code>{bl_id}</code> blacklisted")
+                except ValueError:
+                    await self.send(cid, "❌ Bad ID")
+        elif text.startswith("/unblacklist"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await self.send(cid, "/unblacklist <code>chat_id</code>")
+            else:
+                try:
+                    bl_id = int(parts[1])
+                    self.state.unblacklist_chat(bl_id)
+                    await self.send(cid, f"✅ Chat <code>{bl_id}</code> removed from blacklist")
+                except ValueError:
+                    await self.send(cid, "❌ Bad ID")
         elif text == "/status":
             if self._status_callback:
                 status = await self._status_callback()
@@ -801,6 +877,12 @@ class LeadMonitor:
         self._waiting_auth = False
         self._auth_event = asyncio.Event()
         self._auth_code: Optional[str] = None
+        # Rate limiter: max 20 alerts per 60 seconds
+        self._alert_times: list[float] = []
+        self._alert_rate_limit = 20
+        self._alert_rate_window = 60
+        # Sender cache to avoid repeated get_sender() calls
+        self._sender_cache: TTLCache = TTLCache(maxsize=5_000, ttl=3600)
 
     async def _check_session(self) -> bool:
         """Check if existing session is valid."""
@@ -907,7 +989,8 @@ class LeadMonitor:
         self.state.cleanup_old_hashes()
         await self.discover_chats()
         self.client.add_event_handler(self.on_msg, events.NewMessage())
-        logger.info("Listening %d chats, target=%s", len(self.watched), self.state.target)
+        logger.info("Listening %d chats, target=%s, blacklisted=%d", 
+                    len(self.watched), self.state.target, len(self.state.blacklisted_chats))
 
     async def discover_chats(self):
         me = await self.client.get_me(); self._me_id = me.id; count = 0; names = []
@@ -926,18 +1009,32 @@ class LeadMonitor:
             logger.error("No chats!"); await self.client.disconnect(); sys.exit(1)
         logger.info("Discovered %d chats",count)
 
-    def is_dup(self, c, t):
-        """Check duplicate using BOTH in-memory cache AND persistent state."""
-        k = dedup_key(c, t)
-        # Fast check: in-memory TTLCache
-        if k in self.cache:
+    async def _check_rate_limit(self) -> bool:
+        """Returns True if rate limited (should skip alert)."""
+        now = time.time()
+        # Remove old entries outside window
+        self._alert_times = [t for t in self._alert_times if now - t < self._alert_rate_window]
+        if len(self._alert_times) >= self._alert_rate_limit:
+            logger.warning("RATE LIMITED: %d alerts in %ds, skipping", 
+                          len(self._alert_times), self._alert_rate_window)
             return True
-        # Persistent check: state.json
-        if self.state.is_sent(k):
+        self._alert_times.append(now)
+        return False
+
+    def is_dup(self, chat_id: int, message_id: int, text: str) -> bool:
+        """Check duplicate using message_id (primary) + text hash (fallback)."""
+        # Primary: unique per message
+        msg_key = msg_dedup_key(chat_id, message_id)
+        if self.state.is_sent(msg_key):
             return True
-        # Mark as sent in both
-        self.cache[k] = True
-        self.state.mark_sent(k)
+        # Secondary: text-based (catches forwarded duplicates)
+        txt_key = dedup_key(chat_id, text)
+        if txt_key in self.cache or self.state.is_sent(txt_key):
+            return True
+        # Mark both
+        self.state.mark_sent(msg_key)
+        self.cache[txt_key] = True
+        self.state.mark_sent(txt_key)
         return False
 
     def find_trig(self, nt: str) -> Optional[str]:
@@ -952,6 +1049,11 @@ class LeadMonitor:
             chat = await ev.get_chat()
             if isinstance(chat, User):
                 logger.debug("SKIP DM: chat=%s", ev.chat_id)
+                return
+
+            # ── Чёрный список чатов ───────────────────────────────────────────
+            if self.state.is_blacklisted(ev.chat_id):
+                logger.debug("SKIP blacklisted chat: %s", ev.chat_id)
                 return
 
             sender = await ev.get_sender()
@@ -976,14 +1078,12 @@ class LeadMonitor:
                 cu0 = getattr(chat, 'username', None)
                 self.bot._chats_cache.append((f"{ct0} (@{cu0})" if cu0 else ct0, ev.chat_id))
 
-            self.pat = build_pattern(self.state.keywords)
-            self.custom_pats = build_custom_patterns(self.state.keywords)
             trig = self.find_trig(normalize(raw))
             if trig is None:
                 logger.debug("NO TRIGGER in: '%s'", raw[:60])
                 return
-            if self.is_dup(ev.chat_id, raw):
-                logger.debug("DUP: chat=%s", ev.chat_id)
+            if self.is_dup(ev.chat_id, ev.id, raw):
+                logger.debug("DUP: chat=%s msg=%s", ev.chat_id, ev.id)
                 return
 
             ct = getattr(chat, "title", None) or getattr(chat, "first_name", "?")
@@ -1015,11 +1115,18 @@ class LeadMonitor:
                     if not classification["is_lead"] and classification["confidence"] >= 0.7:
                         logger.info("FALSE_POSITIVE filtered by AI (conf=%.2f): '%s'", 
                                    classification["confidence"], raw[:60])
+                        self.state.inc_ai_filtered()
                         return
+                    self.state.inc_ai_passed()
                     ai_info = f"\n\n🤖 <i>AI: {'✅ Лид' if classification['is_lead'] else '⚠️ Сомнительно'} ({classification['confidence']:.0%}) — {html.escape(classification['reason'])}</i>"
                 except Exception as e:
                     logger.error("AI classification failed: %s", e)
                     # Continue without AI filtering on error
+
+            # Rate limit check before sending
+            if await self._check_rate_limit():
+                logger.warning("RATE LIMITED, skipping alert for: '%s'", raw[:60])
+                return
 
             cte = html.escape(ct)
             if cu:
