@@ -46,7 +46,10 @@ logger = logging.getLogger("lead_monitor")
 # ── State Manager ───────────────────────────────────────────────────────────
 
 class State:
-    """Persistent JSON state: keywords, target, stats, reactions."""
+    """Persistent JSON state: keywords, target, stats, reactions, dedup."""
+
+    DEDUP_MAX_AGE = 7 * 86400  # 7 days
+    DEDUP_MAX_SIZE = 50_000
 
     def __init__(self, path: str):
         self.path = Path(path)
@@ -56,6 +59,7 @@ class State:
             "keywords": [],
             "stats": {"total_triggers": 0, "reacted": 0},
             "reactions": {},  # alert_msg_id -> {"user": name, "time": ts}
+            "sent_hashes": {},  # dedup_hash -> timestamp
         }
         self._load()
 
@@ -64,6 +68,9 @@ class State:
             try:
                 saved = json.loads(self.path.read_text(encoding="utf-8"))
                 self.data.update(saved)
+                # Ensure sent_hashes exists
+                if "sent_hashes" not in self.data:
+                    self.data["sent_hashes"] = {}
                 logger.info("State loaded from %s", self.path)
             except Exception:
                 logger.warning("Corrupt state file, using defaults")
@@ -113,6 +120,36 @@ class State:
     @property
     def stats(self) -> dict:
         return self.data["stats"]
+
+    # ── Persistent dedup ─────────────────────────────────────────────────────
+    def is_sent(self, dedup_hash: str) -> bool:
+        """Check if message was already sent (persistent across restarts)."""
+        hashes = self.data.get("sent_hashes", {})
+        return dedup_hash in hashes
+
+    def mark_sent(self, dedup_hash: str):
+        """Mark message as sent with current timestamp."""
+        now = int(time.time())
+        hashes = self.data.setdefault("sent_hashes", {})
+        hashes[dedup_hash] = now
+        # Cleanup old entries periodically
+        if len(hashes) > self.DEDUP_MAX_SIZE:
+            cutoff = now - self.DEDUP_MAX_AGE
+            self.data["sent_hashes"] = {k: v for k, v in hashes.items() if v > cutoff}
+        self.save()
+
+    def cleanup_old_hashes(self):
+        """Remove hashes older than DEDUP_MAX_AGE."""
+        now = int(time.time())
+        cutoff = now - self.DEDUP_MAX_AGE
+        before = len(self.data.get("sent_hashes", {}))
+        self.data["sent_hashes"] = {
+            k: v for k, v in self.data.get("sent_hashes", {}).items() if v > cutoff
+        }
+        after = len(self.data["sent_hashes"])
+        if before != after:
+            logger.info("Cleaned up %d old dedup hashes", before - after)
+            self.save()
 
 
 # ── Smart Keyword Engine ─────────────────────────────────────────────────────
@@ -665,24 +702,31 @@ class BotAPI:
 
 # ── RouterAI Lead Classifier ────────────────────────────────────────────────
 
-_CLASSIFY_PROMPT = """Ты — классификатор лидов для Telegram чатов. Твоя задача определить, является ли сообщение РЕАЛЬНЫМ бизнес-лидом или это обычное упоминание ключевого слова.
+_CLASSIFY_PROMPT = """Ты — классификатор лидов для Telegram чатов в сфере B2B услуг (лидогенерация, базы данных, HR, арбитраж трафика). 
 
-РЕАЛЬНЫЙ ЛИД — это когда человек:
-- Ищет услуги/товары ("ищу дизайнера", "нужен сайт")
-- Предлагает купить/продать ("куплю базу", "продам лиды")  
-- Запрашивает контакты/сотрудничество
-- Конкретный запрос с деталями (бюджет, сроки, ниша)
+Определи, является ли сообщение РЕАЛЬНЫМ бизнес-лидом или это ложное срабатывание.
 
-ЛОЖНОЕ СРАБАТЫВАНИЕ — это когда:
-- Просто упоминается слово в разговоре
-- Обсуждение темы без конкретного запроса
-- Шутки, мемы, оффтопик
-- Новостной/информационный контекст
+✅ РЕАЛЬНЫЙ ЛИД (is_lead: true):
+- Человек ИЩЕТ услуги/товары для бизнеса: "ищу дизайнера", "нужен сайт", "где взять базу"
+- Предлагает КУПИТЬ/ПРОДАТЬ бизнес-услуги: "куплю базу", "продам лиды", "есть база отказников"
+- Запрашивает контакты/сотрудничество по бизнес-тематике
+- Конкретный запрос с деталями: бюджет, сроки, ниша, объём
+- Обсуждение проблем с трафиком, лидами, базами в контексте бизнеса
+- "Проблемы с траффом", "не могу найти лиды", "где брать базу"
 
-Ответь СТРОГО в JSON формате (без markdown):
-{"is_lead": true, "confidence": 0.95, "reason": "конкретный запрос на покупку лидов"}
-или
-{"is_lead": false, "confidence": 0.9, "reason": "просто упоминание слова в разговоре"}
+❌ ЛОЖНОЕ СРАБАТЫВАНИЕ (is_lead: false):
+- Продажа личных вещей: айфон, телефон, машина, квартира, одежда
+- Обычный разговор где случайно встретилось ключевое слово
+- "У меня база по математике", "база отдыха", "базовый тариф"
+- Мемы, шутки, оффтопик, приветствия
+- Новостной/информационный контекст без запроса
+- Обсуждение политики, спорта, развлечений
+- "Лидер группы", "лидерство", "трафик на дороге"
+- Вопросы не связанные с бизнесом: "как настроить телефон", "где купить еду"
+- Рекламный спам нерелевантных услуг
+
+Ответь СТРОГО в JSON формате (без markdown, без пояснений):
+{"is_lead": true, "confidence": 0.95, "reason": "короткое объяснение"}
 
 Сообщение:"""
 
@@ -860,6 +904,7 @@ class LeadMonitor:
 
     async def _post_auth(self):
         """Called after successful authorization."""
+        self.state.cleanup_old_hashes()
         await self.discover_chats()
         self.client.add_event_handler(self.on_msg, events.NewMessage())
         logger.info("Listening %d chats, target=%s", len(self.watched), self.state.target)
@@ -881,10 +926,19 @@ class LeadMonitor:
             logger.error("No chats!"); await self.client.disconnect(); sys.exit(1)
         logger.info("Discovered %d chats",count)
 
-    def is_dup(self,c,t):
-        k=dedup_key(c,t)
-        if k in self.cache: return True
-        self.cache[k]=True; return False
+    def is_dup(self, c, t):
+        """Check duplicate using BOTH in-memory cache AND persistent state."""
+        k = dedup_key(c, t)
+        # Fast check: in-memory TTLCache
+        if k in self.cache:
+            return True
+        # Persistent check: state.json
+        if self.state.is_sent(k):
+            return True
+        # Mark as sent in both
+        self.cache[k] = True
+        self.state.mark_sent(k)
+        return False
 
     def find_trig(self, nt: str) -> Optional[str]:
         return find_trigger(nt, self.pat, self.custom_pats)
@@ -957,9 +1011,10 @@ class LeadMonitor:
                     classification = await classify_lead(raw, trig)
                     logger.info("AI_CLASSIFY|is_lead=%s|confidence=%.2f|reason=%s",
                                classification["is_lead"], classification["confidence"], classification["reason"])
-                    # Only filter if VERY confident it's NOT a lead
-                    if not classification["is_lead"] and classification["confidence"] >= 0.85:
-                        logger.info("FALSE_POSITIVE filtered by AI: '%s'", raw[:60])
+                    # Filter if confident it's NOT a lead (threshold 0.7)
+                    if not classification["is_lead"] and classification["confidence"] >= 0.7:
+                        logger.info("FALSE_POSITIVE filtered by AI (conf=%.2f): '%s'", 
+                                   classification["confidence"], raw[:60])
                         return
                     ai_info = f"\n\n🤖 <i>AI: {'✅ Лид' if classification['is_lead'] else '⚠️ Сомнительно'} ({classification['confidence']:.0%}) — {html.escape(classification['reason'])}</i>"
                 except Exception as e:
