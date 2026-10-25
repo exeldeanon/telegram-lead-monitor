@@ -18,9 +18,12 @@
             <h1>Signal Desk</h1>
           </div>
         </div>
-        <button class="icon-button" id="refresh-button" type="button" aria-label="Обновить список" title="Обновить">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.9-3.9L3 10m0 0V5m0 5h5M4 13a8.1 8.1 0 0 0 14.9 3.9L21 14m0 0v5m0-5h-5"/></svg>
-        </button>
+        <div class="topbar-actions">
+          <button class="button button-quiet topbar-chats" id="chats-button" type="button"><span class="button-glyph">⌘</span> Чаты</button>
+          <button class="icon-button" id="refresh-button" type="button" aria-label="Обновить список" title="Обновить">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.9-3.9L3 10m0 0V5m0 5h5M4 13a8.1 8.1 0 0 0 14.9 3.9L21 14m0 0v5m0-5h-5"/></svg>
+          </button>
+        </div>
       </header>
 
       <main>
@@ -73,6 +76,26 @@
         </section>
       </main>
     </div>
+
+    <div class="sheet-backdrop" id="chat-sheet-backdrop" hidden></div>
+    <aside class="chat-sheet" id="chat-sheet" aria-labelledby="chat-picker-title" aria-hidden="true">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="sheet-header">
+        <div><p class="eyebrow">ИСТОЧНИКИ МОНИТОРИНГА</p><h2 id="chat-picker-title">Выберите чаты</h2></div>
+        <button class="icon-button" id="close-chat-sheet" type="button" aria-label="Закрыть"><span aria-hidden="true">×</span></button>
+      </div>
+      <p class="chat-picker-note">Выбор сохраняется отдельно для каждого Telegram-аккаунта. В мониторинг попадут только отмеченные чаты.</p>
+      <div class="chat-picker-toolbar">
+        <label class="search-field"><span aria-hidden="true">⌕</span><input id="chat-search" type="search" placeholder="Найти чат или @username" autocomplete="off" /></label>
+        <button class="button button-quiet" id="chat-refresh" type="button">Обновить</button>
+      </div>
+      <div class="chat-picker-status" id="chat-picker-status" aria-live="polite"></div>
+      <div class="chat-account-list" id="chat-account-list"></div>
+      <div class="chat-sheet-actions">
+        <button class="button button-quiet" id="cancel-chat-selection" type="button">Отмена</button>
+        <button class="button button-primary" id="save-chat-selection" type="button">Сохранить выбор</button>
+      </div>
+    </aside>
 
     <div class="sheet-backdrop" id="sheet-backdrop" hidden></div>
     <aside class="composer-sheet" id="composer-sheet" aria-labelledby="composer-title" aria-hidden="true">

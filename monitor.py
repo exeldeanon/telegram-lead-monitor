@@ -144,6 +144,8 @@ class State:
             "leads": {},  # lead_id -> candidate card shown in the inbox
             "outreach_template": "",
             "outreach_mode": "manual",
+            "selected_chats": [],
+            "chat_selection_configured": False,
         }
         self._load()
 
@@ -1494,6 +1496,7 @@ class LeadMonitor:
         self.session_string = str(session_string or "").strip()
         self.api_id = api_id
         self.api_hash = api_hash
+        self.chats_file = chats_file
         self.chat_filter_configured = Path(chats_file).exists()
         self.chat_filters = load_lines(chats_file)
         self.chat_filter_ids = {int(x) for x in self.chat_filters if x.lstrip("-").isdigit()}
@@ -1505,6 +1508,12 @@ class LeadMonitor:
         self.chat_filter_configured = not self.allow_all_chats
 
         self.state = State(state_file, default_target=target_chat_id)
+        # Mini App selections are account-specific and take precedence over
+        # the legacy shared chats.txt file once the operator saves them.
+        if self.state.data.get("chat_selection_configured"):
+            self.chat_filters = [str(x) for x in self.state.data.get("selected_chats", [])]
+            self.chat_filter_ids = {int(x) for x in self.chat_filters if x.lstrip("-").isdigit()}
+            self.chat_filter_usernames = {x.lstrip("@").lower() for x in self.chat_filters if not x.lstrip("-").isdigit()}
         if not self.state.outreach_template:
             self.state.outreach_template = account_cfg.get("outreach_template") or global_cfg.get("outreach_template", "")
         if not self.state.keywords:
@@ -1618,6 +1627,7 @@ class LeadMonitor:
 
     async def discover_chats(self):
         me = await self.client.get_me(); self._me_id = me.id; count = 0; names = []
+        self.watched.clear()
         self.logger.info("[%s] Logged in as: %s (ID: %d)", self.name, me.first_name, me.id)
         async for d in self.client.iter_dialogs():
             if d.is_user: continue
@@ -1637,6 +1647,56 @@ class LeadMonitor:
             self.logger.error("[%s] No chats!", self.name)
             return  # Don't sys.exit — other accounts may still work
         self.logger.info("[%s] Discovered %d chats", self.name, count)
+
+    @staticmethod
+    def _marked_chat_id(entity) -> int:
+        """Return the Telegram-compatible ID used in chats.txt and events."""
+        eid = int(entity.id)
+        return (-1000000000000 - eid) if isinstance(entity, Channel) else -eid
+
+    async def list_available_chats(self) -> dict:
+        """List dialogs available to this account for the Mini App picker."""
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            if not await self.client.is_user_authorized():
+                return {"authorized": False, "chats": [], "error": "Аккаунт не авторизован"}
+            chats = []
+            async for dialog in self.client.iter_dialogs():
+                entity = dialog.entity
+                if not isinstance(entity, (Channel, TGChat)):
+                    continue
+                chat_id = self._marked_chat_id(entity)
+                username = (getattr(entity, "username", None) or "").lower()
+                kind = "channel" if isinstance(entity, Channel) and not getattr(entity, "megagroup", False) else "group"
+                chats.append({
+                    "id": chat_id,
+                    "title": getattr(entity, "title", None) or "Без названия",
+                    "username": username,
+                    "kind": kind,
+                    "selected": self._chat_allowed(entity),
+                    "unread_count": int(getattr(dialog, "unread_count", 0) or 0),
+                })
+            chats.sort(key=lambda item: (not item["selected"], item["title"].lower()))
+            return {"authorized": True, "chats": chats}
+        except Exception as exc:
+            self.logger.warning("[%s] Cannot list chats: %s", self.name, exc)
+            return {"authorized": False, "chats": [], "error": str(exc)}
+
+    async def set_selected_chats(self, chat_ids: list[int]) -> dict:
+        """Persist the Mini App selection and refresh the active event filter."""
+        normalized = sorted({int(value) for value in chat_ids})
+        self.state.data["selected_chats"] = normalized
+        self.state.data["chat_selection_configured"] = True
+        self.state.save()
+        self.chat_filters = [str(value) for value in normalized]
+        self.chat_filter_ids = set(normalized)
+        self.chat_filter_usernames = set()
+        self.allow_all_chats = False
+        self.chat_filter_configured = True
+        if self.client.is_connected() and await self.client.is_user_authorized():
+            await self.discover_chats()
+        return {"selected": normalized, "count": len(normalized)}
 
     async def _check_rate_limit(self) -> bool:
         """Returns True if rate limited (should skip alert)."""
@@ -2039,6 +2099,38 @@ class MiniAppServer:
             limit = 50
         return web.json_response({"leads": result[:limit], "stats": stats})
 
+    async def api_chats(self, request: web.Request):
+        """Return account-specific dialogs and save the operator's selection."""
+        is_write = request.method in {"PUT", "PATCH"}
+        await self._auth(request, write=is_write)
+        if is_write:
+            try:
+                payload = await request.json()
+            except Exception:
+                raise web.HTTPBadRequest(text="Expected JSON body")
+            selections = payload.get("selections", {})
+            if not isinstance(selections, dict):
+                raise web.HTTPBadRequest(text="selections must be an object")
+            for worker in self.workers:
+                if worker.name not in selections:
+                    continue
+                values = selections[worker.name]
+                if not isinstance(values, list):
+                    raise web.HTTPBadRequest(text=f"Selection for {worker.name} must be an array")
+                ids = []
+                for value in values:
+                    try:
+                        ids.append(int(value.get("id") if isinstance(value, dict) else value))
+                    except (TypeError, ValueError):
+                        raise web.HTTPBadRequest(text="Chat IDs must be integers")
+                await worker.set_selected_chats(ids)
+
+        accounts = []
+        for worker in self.workers:
+            info = await worker.list_available_chats()
+            accounts.append({"name": worker.name, **info})
+        return web.json_response({"accounts": accounts})
+
     async def api_lead(self, request: web.Request):
         worker, lead = self._find_lead(request.match_info["lead_id"])
         if not lead:
@@ -2125,6 +2217,9 @@ class MiniAppServer:
         app = web.Application()
         app.router.add_get("/", self.index)
         app.router.add_get("/api/leads", self.api_leads)
+        app.router.add_get("/api/chats", self.api_chats)
+        app.router.add_put("/api/chats", self.api_chats)
+        app.router.add_patch("/api/chats", self.api_chats)
         app.router.add_get("/api/leads/{lead_id}", self.api_lead)
         app.router.add_post("/api/leads/{lead_id}/action", self.api_action)
         app.router.add_get("/api/settings", self.api_settings)

@@ -7,6 +7,8 @@
  *         -> { leads: Lead[], stats: { new, review, sent } }
  *   GET   /api/settings -> { mode: "manual" | "approval", template: string }
  *   PATCH /api/settings { mode } -> { mode }
+ *   GET   /api/chats -> { accounts: [{ name, authorized, chats: Chat[] }] }
+ *   PUT   /api/chats { selections: { accountName: [chatId] } }
  *   POST  /api/leads/:id/propose { message } -> { lead: Lead }
  *   POST  /api/leads/:id/skip -> { lead: Lead }
  *   POST  /api/leads/:id/suppress -> { lead: Lead }  // permanent denylist
@@ -36,6 +38,7 @@
     leads: [],
     stats: { new: 0, review: 0, sent: 0 },
     loading: false,
+    chats: { accounts: [], search: '', loading: false, saving: false, open: false },
   };
 
   const DEMO_LEADS = [
@@ -43,6 +46,12 @@
     { id: 'demo-2', status: 'new', source: 'Leadgen Marketplace', source_handle: '@leadgen_market', name: 'Мария К.', username: 'maria_k', initials: 'МК', topic: 'трафик на запуск', message: 'Кто подскажет рабочий источник трафика на новый запуск?', created_at: '11 мин назад', score: 84 },
     { id: 'demo-3', status: 'review', source: 'Арбитраж / вопросы', source_handle: '@traffic_talk', name: 'Алексей Р.', username: 'alex_r', initials: 'АР', topic: 'холодные лиды', message: 'У кого ещё просела конверсия? Ищу свежий подход, старый выгорел.', created_at: '34 мин назад', score: 77 },
   ];
+
+  const DEMO_CHAT_ACCOUNTS = [{ name: 'demo-account', authorized: true, chats: [
+    { id: -1001001, title: 'Бизнес Чат', username: 'business_chat', kind: 'group', selected: true, unread_count: 4 },
+    { id: -1001002, title: 'Leadgen Marketplace', username: 'leadgen_market', kind: 'group', selected: true, unread_count: 0 },
+    { id: -1001003, title: 'Арбитраж / вопросы', username: 'traffic_talk', kind: 'channel', selected: false, unread_count: 12 },
+  ] }];
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -101,6 +110,90 @@
     toast.classList.add('is-visible');
     clearTimeout(showToast.timer);
     showToast.timer = setTimeout(() => toast.classList.remove('is-visible'), 2600);
+  }
+
+  function openChatPicker() {
+    state.chats.open = true;
+    $('#chat-sheet-backdrop').hidden = false;
+    $('#chat-sheet').classList.add('is-open');
+    $('#chat-sheet').setAttribute('aria-hidden', 'false');
+    loadChats();
+  }
+
+  function closeChatPicker() {
+    state.chats.open = false;
+    $('#chat-sheet').classList.remove('is-open');
+    $('#chat-sheet').setAttribute('aria-hidden', 'true');
+    setTimeout(() => { $('#chat-sheet-backdrop').hidden = true; }, 280);
+  }
+
+  function filteredChats(account) {
+    const query = state.chats.search.trim().toLowerCase();
+    if (!query) return account.chats || [];
+    return (account.chats || []).filter((chat) => `${chat.title} ${chat.username} ${chat.id}`.toLowerCase().includes(query));
+  }
+
+  function renderChatPicker() {
+    const list = $('#chat-account-list');
+    const accounts = state.chats.accounts || [];
+    $('#chat-picker-status').textContent = state.chats.loading ? 'Получаю список диалогов…' : state.chats.saving ? 'Сохраняю выбор…' : '';
+    if (!accounts.length && !state.chats.loading) {
+      list.innerHTML = '<div class="chat-empty"><span>⌁</span><strong>Аккаунты пока не готовы</strong><p>Проверьте String Session и обновите список.</p></div>';
+      return;
+    }
+    list.innerHTML = accounts.map((account) => {
+      const chats = filteredChats(account);
+      const selected = (account.chats || []).filter((chat) => chat.selected).length;
+      const body = account.authorized ? (chats.length ? chats.map((chat) => `<label class="chat-row"><input type="checkbox" data-account="${escapeHTML(account.name)}" data-chat-id="${escapeHTML(chat.id)}" ${chat.selected ? 'checked' : ''}><span class="chat-check" aria-hidden="true">✓</span><span class="chat-row-copy"><strong>${escapeHTML(chat.title)}</strong><small>${chat.username ? `@${escapeHTML(chat.username)}` : escapeHTML(chat.kind || 'group')} · ${escapeHTML(chat.id)}</small></span>${chat.unread_count ? `<b class="chat-unread">${escapeHTML(chat.unread_count)}</b>` : ''}</label>`).join('') : '<div class="chat-empty chat-empty-small">По этому фильтру ничего нет.</div>') : `<div class="chat-empty chat-empty-small"><strong>Нет авторизации</strong><p>${escapeHTML(account.error || 'Нужна String Session')}</p></div>`;
+      return `<section class="chat-account" data-account-section="${escapeHTML(account.name)}"><div class="chat-account-head"><div><span class="account-kicker">АККАУНТ</span><h3>${escapeHTML(account.name)}</h3></div><span class="account-count">${selected} выбрано</span></div>${body}</section>`;
+    }).join('');
+  }
+
+  async function loadChats() {
+    state.chats.loading = true;
+    renderChatPicker();
+    try {
+      const data = await request('/api/chats');
+      state.chats.accounts = data?.accounts || [];
+    } catch (_) {
+      if (!tg?.initData && !API_BASE) state.chats.accounts = DEMO_CHAT_ACCOUNTS.map((account) => ({ ...account, chats: account.chats.map((chat) => ({ ...chat })) }));
+      else showToast('Не удалось получить список чатов');
+    } finally {
+      state.chats.loading = false;
+      renderChatPicker();
+    }
+  }
+
+  async function saveChatSelection() {
+    const selections = {};
+    state.chats.accounts.forEach((account) => {
+      selections[account.name] = (account.chats || []).filter((chat) => chat.selected).map((chat) => Number(chat.id));
+    });
+    $$('#chat-account-list input[type="checkbox"]').forEach((input) => {
+      const account = state.chats.accounts.find((item) => item.name === input.dataset.account);
+      const chat = account?.chats?.find((item) => Number(item.id) === Number(input.dataset.chatId));
+      if (chat) chat.selected = input.checked;
+    });
+    state.chats.accounts.forEach((account) => {
+      selections[account.name] = (account.chats || []).filter((chat) => chat.selected).map((chat) => Number(chat.id));
+    });
+    state.chats.saving = true;
+    renderChatPicker();
+    try {
+      const data = await request('/api/chats', { method: 'PUT', body: JSON.stringify({ selections }) });
+      if (data?.accounts) state.chats.accounts = data.accounts;
+      closeChatPicker();
+      showToast('Список чатов сохранён');
+    } catch (_) {
+      if (!tg?.initData && !API_BASE) {
+        state.chats.accounts.forEach((account) => (account.chats || []).forEach((chat) => { chat.selected = Boolean(selections[account.name]?.includes(Number(chat.id))); }));
+        closeChatPicker();
+        showToast('Список чатов сохранён');
+      } else showToast('Не удалось сохранить список чатов');
+    } finally {
+      state.chats.saving = false;
+      renderChatPicker();
+    }
   }
 
   async function request(path, options = {}) {
@@ -221,6 +314,13 @@
   $$('.filter-tab').forEach((tab) => tab.addEventListener('click', () => { state.filter = tab.dataset.filter; loadData(); }));
   $('#mode-select').addEventListener('change', (event) => saveMode(event.target.value));
   $('#refresh-button').addEventListener('click', () => { loadData(); showToast('Обновляю поток…'); });
+  $('#chats-button').addEventListener('click', openChatPicker);
+  $('#close-chat-sheet').addEventListener('click', closeChatPicker);
+  $('#cancel-chat-selection').addEventListener('click', closeChatPicker);
+  $('#chat-sheet-backdrop').addEventListener('click', closeChatPicker);
+  $('#chat-refresh').addEventListener('click', loadChats);
+  $('#save-chat-selection').addEventListener('click', saveChatSelection);
+  $('#chat-search').addEventListener('input', (event) => { state.chats.search = event.target.value; renderChatPicker(); });
   $('#close-sheet').addEventListener('click', closeComposer);
   $('#cancel-compose').addEventListener('click', closeComposer);
   $('#sheet-backdrop').addEventListener('click', closeComposer);
@@ -231,7 +331,11 @@
     textarea.setRangeText(button.dataset.token, start, textarea.selectionEnd, 'end');
     textarea.focus();
   }));
-  document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && state.selectedLead) closeComposer(); });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    if (state.selectedLead) closeComposer();
+    else if (state.chats.open) closeChatPicker();
+  });
 
   loadData();
 })();
