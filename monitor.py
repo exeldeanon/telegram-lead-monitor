@@ -35,6 +35,25 @@ def runtime_web_port() -> int:
 
 def load_config() -> dict:
     """Load config from config.json, with fallback to .env for single-account compat."""
+    config_json = os.environ.get("CONFIG_JSON", "").strip()
+    if config_json:
+        try:
+            cfg = json.loads(config_json)
+            cfg.setdefault("registry_file", os.environ.get("REGISTRY_FILE", "lead_registry.json"))
+            cfg.setdefault("outreach_template", os.environ.get(
+                "OUTREACH_TEMPLATE",
+                "Здравствуйте, {first_name}! Вы писали про «{trigger}» в чате «{chat_title}». "
+                "Если вопрос ещё актуален, могу предложить вариант решения. Если сообщения не нужны, напишите «стоп»."
+            ))
+            cfg.setdefault("operator_user_ids", [int(x) for x in os.environ.get("OPERATOR_USER_IDS", "").split(",") if x.strip().isdigit()])
+            cfg.setdefault("webapp_url", os.environ.get("WEBAPP_URL", ""))
+            cfg.setdefault("webapp_host", runtime_web_host())
+            cfg.setdefault("webapp_port", runtime_web_port())
+            cfg.setdefault("webapp_allow_unauth", os.environ.get("WEBAPP_ALLOW_UNAUTH", "false").lower() == "true")
+            logger_cfg.info("Config loaded from CONFIG_JSON (%d accounts)", len(cfg.get("accounts", [])))
+            return cfg
+        except Exception as e:
+            logger_cfg.warning("Failed to parse CONFIG_JSON, falling back to file/.env: %s", e)
     cfg_path = Path(CONFIG_FILE)
     if cfg_path.exists():
         try:
