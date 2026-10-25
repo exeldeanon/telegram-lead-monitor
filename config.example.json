@@ -1,0 +1,27 @@
+{
+  "registry_file": "lead_registry.json",
+  "outreach_template": "Здравствуйте, {first_name}! Вы писали про «{trigger}» в чате «{chat_title}». Если вопрос актуален, могу помочь. Если сообщения не нужны, напишите «стоп».",
+  "operator_user_ids": [123456789],
+  "webapp_url": "https://monitor.example.com/",
+  "webapp_host": "127.0.0.1",
+  "webapp_port": 8080,
+  "webapp_allow_unauth": false,
+  "dedup_ttl": 1800,
+  "headless": true,
+  "accounts": [
+    {
+      "name": "main",
+      "api_id": 12345678,
+      "api_hash": "replace-me",
+      "session_name": "monitor_main",
+      "session_string": "",
+      "bot_token": "replace-me",
+      "phone": "+70000000000",
+      "target_chat_id": -1001234567890,
+      "target_thread_id": 0,
+      "keywords_file": "keywords.txt",
+      "chats_file": "chats.txt",
+      "state_file": "state_main.json"
+    }
+  ]
+}

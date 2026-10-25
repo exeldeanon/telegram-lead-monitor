@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#12110f" />
+    <title>Signal Desk · Telegram Lead Inbox</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js?64"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-lockup" aria-label="Signal Desk">
+          <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+          <div>
+            <p class="eyebrow">TELEGRAM / LEAD INBOX</p>
+            <h1>Signal Desk</h1>
+          </div>
+        </div>
+        <button class="icon-button" id="refresh-button" type="button" aria-label="Обновить список" title="Обновить">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-14.9-3.9L3 10m0 0V5m0 5h5M4 13a8.1 8.1 0 0 0 14.9 3.9L21 14m0 0v5m0-5h-5"/></svg>
+        </button>
+      </header>
+
+      <main>
+        <section class="hero-panel" aria-labelledby="inbox-title">
+          <div class="hero-copy">
+            <p class="kicker"><span class="live-dot"></span> Мониторинг активен</p>
+            <h2 id="inbox-title">Лиды, которым<br /><em>есть что сказать.</em></h2>
+            <p class="hero-note">Сначала контекст и сигнал. Отправка — только после вашего решения.</p>
+          </div>
+          <div class="hero-orbit" aria-hidden="true">
+            <div class="orbit-ring ring-one"></div>
+            <div class="orbit-ring ring-two"></div>
+            <div class="orbit-core">SD</div>
+          </div>
+        </section>
+
+        <section class="stats-grid" aria-label="Статистика лидов">
+          <div class="stat-card stat-accent"><span>Новые</span><strong id="stat-new">—</strong><small>за сегодня</small></div>
+          <div class="stat-card"><span>На проверке</span><strong id="stat-review">—</strong><small>нужен взгляд</small></div>
+          <div class="stat-card"><span>Отправлено</span><strong id="stat-sent">—</strong><small>за 7 дней</small></div>
+        </section>
+
+        <section class="control-strip" aria-label="Фильтр и режим работы">
+          <div class="section-label">Поток</div>
+          <div class="filter-tabs" role="tablist" aria-label="Фильтр лидов">
+            <button class="filter-tab is-active" data-filter="new" role="tab" aria-selected="true" type="button">Новые <b id="new-count">0</b></button>
+            <button class="filter-tab" data-filter="review" role="tab" aria-selected="false" type="button">На проверке</button>
+            <button class="filter-tab" data-filter="all" role="tab" aria-selected="false" type="button">Все</button>
+          </div>
+          <div class="mode-control">
+            <label for="mode-select">Режим</label>
+            <select id="mode-select" aria-label="Режим отправки">
+              <option value="manual">Ручной</option>
+              <option value="approval">С подтверждением</option>
+            </select>
+          </div>
+        </section>
+
+        <section class="lead-stack" id="lead-list" aria-live="polite" aria-busy="false"></section>
+
+        <section class="empty-state" id="empty-state" hidden>
+          <div class="empty-glyph">✦</div>
+          <h3>Поток чист</h3>
+          <p>Новых сигналов пока нет. Можно спокойно работать дальше.</p>
+        </section>
+
+        <section class="guardrail-note">
+          <div class="guardrail-icon">✓</div>
+          <div><strong>Контроль у вас</strong><span>Мы не пишем людям без вашего разрешения. Для каждого лида сохраняется история решения.</span></div>
+        </section>
+      </main>
+    </div>
+
+    <div class="sheet-backdrop" id="sheet-backdrop" hidden></div>
+    <aside class="composer-sheet" id="composer-sheet" aria-labelledby="composer-title" aria-hidden="true">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <div class="sheet-header">
+        <div><p class="eyebrow">ПОДГОТОВКА ОТВЕТА</p><h2 id="composer-title">Предложить отправку</h2></div>
+        <button class="icon-button" id="close-sheet" type="button" aria-label="Закрыть"><span aria-hidden="true">×</span></button>
+      </div>
+      <div id="composer-context" class="composer-context"></div>
+      <label class="field-label" for="message-template">Сообщение</label>
+      <textarea id="message-template" rows="6" spellcheck="true"></textarea>
+      <div class="template-hint"><span>Переменные</span><button type="button" data-token="{{first_name}}">Имя</button><button type="button" data-token="{{topic}}">Тема</button></div>
+      <div class="sheet-actions">
+        <button class="button button-quiet" id="cancel-compose" type="button">Отмена</button>
+        <button class="button button-primary" id="send-compose" type="button"><span>Отправить</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 14-7-3 14-4-5-7-2Zm7 2 4-7"/></svg></button>
+      </div>
+      <p class="sheet-footnote">Отправка будет выполнена подключённым Telegram-аккаунтом и попадёт в журнал.</p>
+    </aside>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>

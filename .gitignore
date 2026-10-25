@@ -2,8 +2,13 @@
 *.session
 *.session-journal
 state.json
+state_*.json
+lead_registry.json
+config.json
+*.tmp
 monitor.log
 __pycache__/
 *.pyc
 venv/
 .venv/
+data/
